@@ -7,3 +7,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 运行期数据
+*.db
+*.db-wal
+*.db-shm
+workflow.db
