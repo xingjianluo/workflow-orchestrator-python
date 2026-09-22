@@ -7,3 +7,10 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地运行产物
+workflow.db
+workflow.db-wal
+workflow.db-shm
+*.db
+.smoke/
