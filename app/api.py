@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 
 from app.engine import WorkflowError
 from app.schemas import JobOut, JobSubmitIn
@@ -39,6 +39,7 @@ def build_router(get_engine) -> APIRouter:
                 specs=specs,
                 idempotency_key=payload.idempotency_key,
                 max_concurrency=payload.max_concurrency,
+                budget_seconds=payload.budget_seconds,
             )
         except WorkflowError as exc:
             raise _http_for(exc) from exc

@@ -45,6 +45,13 @@ CREATE TABLE IF NOT EXISTS steps (
 CREATE INDEX IF NOT EXISTS idx_steps_job ON steps(job_id);
 """
 
+# 既有库的增量列（CREATE TABLE IF NOT EXISTS 不会修改已存在的表）
+_JOB_EXTRA_COLUMNS = {
+    "budget_seconds": "REAL",        # 整体时间预算（秒），NULL 表示不启用
+    "deadline_at": "REAL",           # 预算到期的墙钟时间戳
+    "cancel_requested_at": "REAL",   # 取消请求落盘的墙钟时刻
+}
+
 
 def _spec_to_json(spec: StepSpec) -> str:
     return json.dumps(
@@ -107,6 +114,12 @@ class JobStore:
     def init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            existing = {
+                r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")
+            }
+            for col, ddl in _JOB_EXTRA_COLUMNS.items():
+                if col not in existing:
+                    self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
 
     def close(self) -> None:
         with self._lock:
@@ -119,8 +132,9 @@ class JobStore:
             try:
                 self._conn.execute(
                     """INSERT INTO jobs(id, idempotency_key, status, max_concurrency,
-                       cancel_requested, created_at, updated_at, error, request_payload)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                       cancel_requested, created_at, updated_at, error, request_payload,
+                       budget_seconds, deadline_at, cancel_requested_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         job.id,
                         job.idempotency_key,
@@ -131,6 +145,9 @@ class JobStore:
                         job.updated_at,
                         job.error,
                         _dumps(job.request_payload),
+                        job.budget_seconds,
+                        job.deadline_at,
+                        job.cancel_requested_at,
                     ),
                 )
                 for spec in specs:
@@ -169,6 +186,9 @@ class JobStore:
             updated_at=row["updated_at"],
             error=row["error"],
             request_payload=_loads(row["request_payload"]),
+            budget_seconds=row["budget_seconds"],
+            deadline_at=row["deadline_at"],
+            cancel_requested_at=row["cancel_requested_at"],
         )
 
     def get_job(self, job_id: str) -> JobState | None:
@@ -190,7 +210,9 @@ class JobStore:
         with self._lock:
             self._conn.execute(
                 """UPDATE jobs SET status=?, max_concurrency=?, cancel_requested=?,
-                   updated_at=?, error=?, request_payload=? WHERE id=?""",
+                   updated_at=?, error=?, request_payload=?,
+                   budget_seconds=?, deadline_at=?, cancel_requested_at=?
+                   WHERE id=?""",
                 (
                     job.status.value,
                     int(job.max_concurrency),
@@ -198,9 +220,32 @@ class JobStore:
                     job.updated_at,
                     job.error,
                     _dumps(job.request_payload),
+                    job.budget_seconds,
+                    job.deadline_at,
+                    job.cancel_requested_at,
                     job.id,
                 ),
             )
+
+    def try_set_cancel_requested(self, job_id: str, ts: float) -> JobState | None:
+        """仅当作业非终态时置取消标记（定向 UPDATE，不覆盖状态列）。
+
+        返回落盘后的最新作业行；作业不存在或已终态时返回 None。
+        定向更新避免与调度器的状态写互相覆盖（取消只写标记列）。
+        """
+        from app.models import JOB_TERMINAL
+
+        terminal = tuple(s.value for s in JOB_TERMINAL)
+        placeholders = ",".join("?" for _ in terminal)
+        with self._lock:
+            cur = self._conn.execute(
+                f"""UPDATE jobs SET cancel_requested=1, cancel_requested_at=?,
+                    updated_at=? WHERE id=? AND status NOT IN ({placeholders})""",
+                (ts, time.time(), job_id, *terminal),
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get_job(job_id)
 
     def list_all_jobs(self) -> list[JobState]:
         with self._lock:

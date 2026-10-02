@@ -12,7 +12,6 @@ import asyncio
 
 from app.engine import IdempotencyConflict
 from app.models import JobStatus, StepSpec, StepStatus
-
 from tests.conftest import wait_for_status
 
 

@@ -15,7 +15,6 @@ from app.engine import WorkflowEngine
 from app.executor import StepExecutor
 from app.models import JobStatus, StepSpec, StepStatus
 from app.store import JobStore
-
 from tests.conftest import wait_for_status
 
 

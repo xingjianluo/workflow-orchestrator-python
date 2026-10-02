@@ -35,6 +35,11 @@ class StepIn(BaseModel):
 class JobSubmitIn(BaseModel):
     idempotency_key: str | None = None
     max_concurrency: int = Field(default=2, ge=1)
+    budget_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        description="作业整体时间预算（墙钟秒），从接受时刻起算；缺省不启用",
+    )
     steps: list[StepIn] = Field(min_length=1)
 
 
@@ -54,17 +59,21 @@ class JobOut(BaseModel):
     status: JobStatus
     cancel_requested: bool
     max_concurrency: int
+    budget_seconds: float | None = None
+    deadline_at: float | None = None
     error: str | None = None
     steps: list[StepOut]
 
     @classmethod
-    def from_state(cls, job: JobState, steps: list[StepState]) -> "JobOut":
+    def from_state(cls, job: JobState, steps: list[StepState]) -> JobOut:
         return cls(
             job_id=job.id,
             idempotency_key=job.idempotency_key,
             status=job.status,
             cancel_requested=job.cancel_requested,
             max_concurrency=job.max_concurrency,
+            budget_seconds=job.budget_seconds,
+            deadline_at=job.deadline_at,
             error=job.error,
             steps=[
                 StepOut(

@@ -2,7 +2,8 @@
 
 在 FastAPI 之上实现的一套可本地运行的异步工作流编排能力：作业由带依赖关系的
 步骤（DAG）组成，支持**幂等提交、并发上限、依赖编排、失败退避重试、取消传播、
-进程重启恢复**。作业与步骤的每次状态跃迁都落 SQLite 并打印可解释的 trace 日志。
+整体时间预算、进程重启恢复**。作业与步骤的每次状态跃迁都落 SQLite 并打印可解释的
+trace 日志。
 
 ## 1. 快速开始
 
@@ -33,8 +34,8 @@ curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' -d '{
 
 | 接口 | 说明 |
 | --- | --- |
-| `POST /jobs` | 提交作业（201）。同幂等键+同请求体返回同一作业；请求体不一致返回 409 |
-| `GET /jobs/{job_id}` | 查询作业与全部步骤的实时状态 |
+| `POST /jobs` | 提交作业（201）。同幂等键+同请求体返回同一作业；请求体不一致返回 409。可选字段 `budget_seconds` 声明整体时间预算 |
+| `GET /jobs/{job_id}` | 查询作业与全部步骤的实时状态（含 `budget_seconds` / `deadline_at`） |
 | `POST /jobs/{job_id}/cancel` | 请求取消；终态作业返回 409，未知作业返回 404 |
 
 错误响应体形如：
@@ -66,12 +67,14 @@ curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' -d '{
 ```
 PENDING ──> RUNNING ──> SUCCEEDED     全部步骤 SUCCEEDED
                      ├─> FAILED        存在 FAILED/BLOCKED 终态步骤
-                     └─> CANCELLED     收到取消且仍有未完成步骤
+                     ├─> CANCELLED     收到取消且仍有未完成步骤
+                     └─> TIMED_OUT     整体时间预算耗尽且仍有未完成步骤
 ```
 
-`SUCCEEDED / FAILED / CANCELLED` 为终态。`error` 字段在 FAILED 时汇总各失败
-步骤及其归因，例如：
-`c(failed:retry_exhausted); d(blocked:upstream_failed)`。
+`SUCCEEDED / FAILED / CANCELLED / TIMED_OUT` 为终态。`error` 字段在 FAILED 时
+汇总各失败步骤及其归因，例如：
+`c(failed:retry_exhausted); d(blocked:upstream_failed)`；在 TIMED_OUT 时为
+`budget_exhausted: ...`。
 
 ### 步骤状态 `StepStatus`
 
@@ -82,18 +85,21 @@ PENDING ──依赖满足──> READY ──获得并发槽──> RUNNING ─
    │                   │                      │
    │                   │                      └─attempt>=max_attempts─> FAILED(终态, retry_exhausted)
    │                   │
-   └──上游 FAILED/BLOCKED/CANCELLED──> BLOCKED(终态, upstream_failed)
-   └──作业取消且本步骤未完成──────────> CANCELLED(终态, cancelled)
+   └──上游 FAILED/BLOCKED/CANCELLED/TIMED_OUT──> BLOCKED(终态, upstream_failed)
+   └──作业取消且本步骤未完成───────────────────> CANCELLED(终态, cancelled)
+   └──预算耗尽且本步骤未完成───────────────────> TIMED_OUT(终态, budget_exhausted)
 ```
 
-终态集合：`SUCCEEDED / FAILED / BLOCKED / CANCELLED`。
+终态集合：`SUCCEEDED / FAILED / BLOCKED / CANCELLED / TIMED_OUT`。
 
 关键不变量：
 
-- **下游不会被静默跳过**：任一依赖进入 `FAILED/BLOCKED/CANCELLED`，该步骤立即
-  转为 `BLOCKED`（`fail_reason=upstream_failed`，`attempt=0`），阻断沿依赖链传播。
+- **下游不会被静默跳过**：任一依赖进入 `FAILED/BLOCKED/CANCELLED/TIMED_OUT`，该步骤
+  立即转为 `BLOCKED`（`fail_reason=upstream_failed`，`attempt=0`），阻断沿依赖链传播；
+  作业级取消/超预算清扫则把所有未终态步骤分别直接置为 `CANCELLED` / `TIMED_OUT`。
 - **失败原因可区分**：步骤终态携带 `fail_reason`，取值
-  `retry_exhausted`（重试耗尽）/ `upstream_failed`（被上游阻断）/ `cancelled`（取消）；
+  `retry_exhausted`（重试耗尽）/ `upstream_failed`（被上游阻断）/
+  `cancelled`（人工取消）/ `budget_exhausted`（整体预算耗尽）；
   `error` 字段保留最近一次失败的底层原因（如 `forced_failure: boom`）。
 - 状态以字符串枚举落库（`pending/running/...`），API 输出稳定字符串。
 
@@ -139,7 +145,38 @@ PENDING ──依赖满足──> READY ──获得并发槽──> RUNNING ─
 - 已 `SUCCEEDED` 的步骤结果原样保留、不被篡改；作业 → `CANCELLED`。
 - 对已终态作业取消返回 409 `job_already_terminal`。
 
-## 6. 重启恢复语义（at-least-once 调度 + 不重复成功）
+## 6. 整体时间预算（墙钟）
+
+提交时带 `budget_seconds`（秒，>0）即可为整个作业声明时间预算：
+
+- **计时方式**：从作业被接受的时刻起算，按**墙钟**（真实经过时间）扣减，
+  不是 CPU 时间。接受时计算 `deadline_at = accepted_at + budget_seconds` 并落库，
+  之后所有判定都只比较当前墙钟与 `deadline_at`。
+- **到期收尾**：到点后仍有未终态步骤时，调度器执行超时清扫：
+  所有未终态步骤（运行中 / 退避等待 / 排队等槽位 / 等依赖）→
+  `TIMED_OUT`（`fail_reason=budget_exhausted`），运行中的任务被立即中断；
+  已 `SUCCEEDED` 的步骤与结果原样保留；作业 → `TIMED_OUT`
+  （`error=budget_exhausted: ...`）。该终态与 `CANCELLED`（人工取消）、
+  `FAILED`（步骤失败）完全区分。
+- **不再放行**：预算用尽后，退避中的步骤到点不会再重跑，排队等并发额度的
+  步骤也不会再获得槽位（执行前在槽内做预算二次检查）。
+- **跨重启连续**：`deadline_at` 是绝对墙钟时间戳，停机期间时间自然计入。
+  重启时若 `deadline_at` 已过，作业在恢复阶段**直接**落 `TIMED_OUT`
+  （trace 事件 `job_timed_out`，basis 注明 `deadline_at already passed at
+  engine start`），不重建调度器、不再执行任何步骤；若尚未到期，则按剩余
+  预算继续，已用掉的时间不会重置。
+- **与取消撞车的仲裁**：取消请求落盘时记录 `cancel_requested_at`。两者同时
+  悬置时按事件发生先后判定，结果与调度 tick 时机无关：
+  - `cancel_requested_at <= deadline_at` → `CANCELLED`（先取消后到点）；
+  - `deadline_at < cancel_requested_at` → `TIMED_OUT`（先到点后取消，
+    取消请求即使被接受也不改变归因）；
+  - 作业已在终态后再取消 → 409 `job_already_terminal`，状态不再变化。
+- **兼容范围**：不带 `budget_seconds` 的作业不设置 `deadline_at`，
+  上述检查全部短路，行为与预算特性引入前**完全一致**。
+- **幂等**：`budget_seconds` 属于规范化请求体的一部分，同幂等键但预算不同
+  视为请求体不一致，返回 409 `idempotency_conflict`。
+
+## 7. 重启恢复语义（at-least-once 调度 + 不重复成功）
 
 - 所有状态变更在决策点同步写入 SQLite（WAL 模式，`synchronous=FULL`，写事务加锁），
   步骤的 spec 以 JSON 随步骤行持久化。
@@ -150,10 +187,13 @@ PENDING ──依赖满足──> READY ──获得并发槽──> RUNNING ─
     重置为 `READY` 并重新调度（trace 事件 `step_recovered`），`attempt` 计数保留，
     因此重试上限不会因重启被放宽或重置；
   - 已终态作业保持终态，其幂等键在新进程中仍然有效。
+- 带整体时间预算的作业：`deadline_at` 为绝对墙钟时间戳，重启后接着扣；
+  若恢复时已过期，作业直接落 `TIMED_OUT`（取消请求先于到点的落 `CANCELLED`），
+  详见第 6 节。
 - 语义说明：中断的在途尝试可能产生外部副作用，因此恢复保证的是
   **“已成功步骤不重复执行、未成功步骤继续到确定终态”**，而非恰好一次的外部副作用。
 
-## 7. 可观测性：trace 日志
+## 8. 可观测性：trace 日志
 
 引擎在每个决策点输出 `workflow.engine` 的 INFO 日志，事件包含
 `job_id / step / status / attempt / basis（判定依据）`，例如：
@@ -163,18 +203,21 @@ trace event=step_ready     ... status=ready    basis=all dependencies succeeded
 trace event=step_retrying  ... attempt=1 backoff_seconds=0.05 next_attempt=2
 trace event=step_blocked   ... status=blocked  basis=upstream in {failed,blocked,cancelled}
 trace event=step_failed    ... status=failed   basis=attempt >= max_attempts
+trace event=step_timed_out ... status=timed_out basis=wall-clock deadline_at reached while step unfinished
+trace event=job_timed_out  ... status=timed_out basis=now >= deadline_at with unfinished steps
 trace event=submit_rejected ... reason=idempotency_conflict basis=same key, different ...
 trace event=step_recovered ... basis=process restart; no success result, reschedule
 ```
 
-## 8. 本地验证
+## 9. 本地验证
 
 ```bash
-uv run pytest -q                 # 全部 20 个用例
-uv run pytest tests/test_idempotency_concurrency.py   # 并发提交 / 幂等冲突
-uv run pytest tests/test_orchestration_retry.py       # 依赖 / 并发 / 阻断 / 重试耗尽
-uv run pytest tests/test_cancel.py                    # 取消传播
-uv run pytest tests/test_recovery.py                  # 进程重启恢复
+uv run pytest -q                 # 全部 30 个用例
+uv run pytest tests/test_idempotency_concurrency.py   # 并发提交 / 幂等冲突（6 个）
+uv run pytest tests/test_orchestration_retry.py       # 依赖 / 并发 / 阻断 / 重试耗尽（6 个）
+uv run pytest tests/test_cancel.py                    # 取消传播（5 个）
+uv run pytest tests/test_recovery.py                  # 进程重启恢复（4 个）
+uv run pytest tests/test_budget.py                    # 整体时间预算（9 个）
 ```
 
 每个用例都会打印：
@@ -195,15 +238,28 @@ WORKFLOW_DB=./wf.db uv run uvicorn main:app --port 8000
 #    中断的长步骤被 step_recovered 重新调度，作业继续到 SUCCEEDED
 ```
 
-## 9. 代码结构
+### 手动验证整体时间预算
+
+```bash
+WORKFLOW_DB=./wf.db uv run uvicorn main:app --port 8000
+# 1) 提交带预算的作业：
+#    curl -X POST localhost:8000/jobs -H 'Content-Type: application/json' -d '{
+#      "budget_seconds": 5, "steps": [{"key":"a","action":"sleep","params":{"seconds":60}}]}'
+# 2) 约 5s 后 GET /jobs/{id}：status=timed_out，步骤 fail_reason=budget_exhausted
+# 3) 若在预算到期前 kill 服务、等预算过后再重启：
+#    恢复时作业直接落 timed_out（trace: job_timed_out /
+#    basis=deadline_at already passed at engine start），不再执行任何步骤
+```
+
+## 10. 代码结构
 
 ```
 main.py              FastAPI 入口与 lifespan（启动即恢复、关闭落盘）
 app/models.py        状态枚举、作业/步骤领域模型、拒绝原因码
 app/schemas.py       HTTP 请求/响应 pydantic 模型
-app/store.py         SQLite 持久化（WAL、写锁、JSON 字段）
+app/store.py         SQLite 持久化（WAL、写锁、JSON 字段、增量列迁移）
 app/executor.py      内置 action 执行器（succeed/fail/flaky/sleep/echo）
-app/engine.py        编排引擎：幂等、DAG 调度、信号量、退避重试、取消、恢复
+app/engine.py        编排引擎：幂等、DAG 调度、信号量、退避重试、取消、时间预算、恢复
 app/api.py           /jobs 提交/查询/取消路由
-tests/               四类场景测试 + 打印输入/跃迁/判定依据的夹具
+tests/               五类场景测试 + 打印输入/跃迁/判定依据的夹具
 ```

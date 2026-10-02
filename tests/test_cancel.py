@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from app.engine import WorkflowError
 from app.models import JobStatus, RejectReason, StepSpec, StepStatus
-
 from tests.conftest import wait_for_status
 
 

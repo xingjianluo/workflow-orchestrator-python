@@ -13,7 +13,6 @@ from __future__ import annotations
 import time
 
 from app.models import JobStatus, StepSpec, StepStatus
-
 from tests.conftest import wait_for_status
 
 

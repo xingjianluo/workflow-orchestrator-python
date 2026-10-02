@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import tempfile
 
 import pytest
 import pytest_asyncio
@@ -61,6 +60,7 @@ async def engine(db_path):
 async def client(engine, db_path):
     """ASGI 测试客户端，与引擎共享同一事件循环。"""
     from httpx import ASGITransport, AsyncClient
+
     import main as main_module
 
     main_module._engine = engine  # 让 get_engine 返回测试引擎

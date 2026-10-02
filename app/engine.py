@@ -31,12 +31,13 @@ from typing import Any
 
 from app.executor import StepExecutionError, StepExecutor
 from app.models import (
+    JOB_TERMINAL,
+    STEP_FAILING,
+    STEP_TERMINAL,
     CancellationError,
     JobState,
     JobStatus,
     RejectReason,
-    STEP_FAILING,
-    STEP_TERMINAL,
     StepSpec,
     StepState,
     StepStatus,
@@ -79,10 +80,15 @@ def _trace(event: str, **fields: Any) -> None:
         sink(event, fields)
 
 
-def canonical_request(specs: list[StepSpec], max_concurrency: int) -> dict[str, Any]:
+def canonical_request(
+    specs: list[StepSpec],
+    max_concurrency: int,
+    budget_seconds: float | None = None,
+) -> dict[str, Any]:
     """规范化请求体（不含幂等键），用于幂等一致性判定。"""
     return {
         "max_concurrency": max_concurrency,
+        "budget_seconds": budget_seconds,
         "steps": [s.request_payload() for s in specs],
     }
 
@@ -193,7 +199,7 @@ class _JobRunner:
                 async with self._cond:
                     try:
                         await asyncio.wait_for(self._cond.wait(), timeout=0.05)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         pass
         finally:
             _trace("job_scheduler_stop", job_id=self._job_id)
@@ -201,18 +207,28 @@ class _JobRunner:
     async def _tick(self) -> bool:
         """执行一轮调度决策。返回 True 表示作业已到终态。"""
         job = self._job()
-        if job.status in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED):
+        if job.status in JOB_TERMINAL:
             return True
 
         steps = self._steps()
 
-        # 1) 取消传播：仍有未终态步骤时才扫描取消；
-        #    若全部步骤恰好已终态（取消到达太晚），交给终态归并判定。
-        if job.cancel_requested and any(
-            s.status not in STEP_TERMINAL for s in steps.values()
-        ):
-            await self._propagate_cancel(job, steps)
-            return True
+        # 1) 取消/预算仲裁：仍有未终态步骤时才扫描；
+        #    若全部步骤恰好已终态（信号到达太晚），交给终态归并判定。
+        #    两者同时悬置时按“事件发生先后”仲裁，结果与 tick 时机无关：
+        #    cancel_requested_at <= deadline_at -> CANCELLED，否则 TIMED_OUT。
+        if any(s.status not in STEP_TERMINAL for s in steps.values()):
+            budget_expired = (
+                job.deadline_at is not None and time.time() >= job.deadline_at
+            )
+            if job.cancel_requested and (
+                not budget_expired
+                or (job.cancel_requested_at or 0.0) <= (job.deadline_at or 0.0)
+            ):
+                await self._propagate_cancel(job, steps)
+                return True
+            if budget_expired:
+                await self._propagate_timeout(job, steps)
+                return True
 
         # 2) 依赖判定：失败上游 -> BLOCKED；满足依赖 -> READY
         progress = False
@@ -284,6 +300,19 @@ class _JobRunner:
         if all(s.status == StepStatus.SUCCEEDED for s in steps.values()):
             job.status = JobStatus.SUCCEEDED
             self._save_job(job, "job_succeeded", basis="all steps succeeded")
+        elif any(s.status is StepStatus.TIMED_OUT for s in steps.values()):
+            # 防御分支：正常路径上 _propagate_timeout 已终结作业；
+            # 仅当超时清扫与步骤自然完成交错时才可能走到这里。
+            job.status = JobStatus.TIMED_OUT
+            job.error = (
+                f"budget_exhausted: job time budget of {job.budget_seconds}s "
+                "exhausted (wall clock)"
+            )
+            self._save_job(
+                job,
+                "job_timed_out",
+                basis="exists timed_out terminal step",
+            )
         elif job.cancel_requested or any(
             s.status is StepStatus.CANCELLED for s in steps.values()
         ):
@@ -337,6 +366,51 @@ class _JobRunner:
             await asyncio.gather(*running, return_exceptions=True)
         self._stop = True
 
+    # ---------- 预算耗尽 ----------
+    async def _propagate_timeout(
+        self, job: JobState, steps: dict[str, StepState]
+    ) -> None:
+        """预算到期清扫：所有未终态步骤 -> TIMED_OUT，作业 -> TIMED_OUT。
+
+        与取消传播结构对称，但状态与归因完全独立：
+        步骤 fail_reason=budget_exhausted，作业状态 TIMED_OUT，
+        已成功步骤的结果原样保留。
+        """
+        running = [t for k, t in self._tasks.items() if not t.done()]
+        now = time.time()
+        for step in steps.values():
+            if step.status in STEP_TERMINAL:
+                continue
+            step.status = StepStatus.TIMED_OUT
+            step.fail_reason = "budget_exhausted"
+            step.error = "job time budget exhausted before step completed"
+            step.finished_at = now
+            self._save_step(
+                step,
+                "step_timed_out",
+                basis="wall-clock deadline_at reached while step unfinished",
+                deadline_at=job.deadline_at,
+            )
+        job.status = JobStatus.TIMED_OUT
+        job.error = (
+            f"budget_exhausted: job time budget of {job.budget_seconds}s "
+            "exhausted (wall clock)"
+        )
+        self._save_job(
+            job,
+            "job_timed_out",
+            basis="now >= deadline_at with unfinished steps",
+            budget_seconds=job.budget_seconds,
+            deadline_at=job.deadline_at,
+        )
+        # 运行中的任务立即中断；退避等待与排队等槽位的步骤已被标记终态，
+        # 不会再被到点唤醒或放行。
+        for t in running:
+            t.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+        self._stop = True
+
     # ---------- 单步骤执行（含重试/退避/取消） ----------
     async def _run_step(self, key: str) -> None:
         assert self._sem is not None
@@ -358,11 +432,22 @@ class _JobRunner:
 
     async def _execute_with_retry(self, key: str) -> None:
         step = self._steps()[key]
-        # 进入执行前的并发槽内二次检查（可能已被取消/阻断）
+        # 进入执行前的并发槽内二次检查（可能已被取消/阻断/超时清扫）
         if step.status in STEP_TERMINAL:
             return
         job = self._job()
         if job.cancel_requested:
+            return
+        if job.deadline_at is not None and time.time() >= job.deadline_at:
+            # 预算在排队等槽位期间耗尽：不启动本次尝试，
+            # 保持非终态，交由调度循环的 _propagate_timeout 统一收尾。
+            _trace(
+                "step_skipped_budget_exhausted",
+                job_id=self._job_id,
+                step=key,
+                basis="deadline reached while waiting for concurrency slot",
+                deadline_at=job.deadline_at,
+            )
             return
 
         is_retry = step.status == StepStatus.RETRYING
@@ -402,7 +487,7 @@ class _JobRunner:
                 )
             await self._notify()
             raise
-        except TimeoutError as exc:  # asyncio.timeout 超时
+        except TimeoutError:  # asyncio.timeout 超时
             failure = StepExecutionError("timeout", f"timeout after {step.spec.timeout}s")
             self._handle_failure(step, failure)
         except StepExecutionError as exc:
@@ -477,30 +562,91 @@ class WorkflowEngine:
             return
         self._started = True
         recovered = 0
+        expired = 0
         for job in self._store.list_all_jobs():
-            if job.status not in (
-                JobStatus.SUCCEEDED,
-                JobStatus.FAILED,
-                JobStatus.CANCELLED,
-            ):
-                # 崩溃恢复：进程中断时 RUNNING 的尝试不算成功结果，
-                # 重置为 READY 继续调度（attempt 保留，退避到点立即跑）。
-                for step in self._store.list_steps(job.id):
-                    if step.status in (StepStatus.RUNNING, StepStatus.RETRYING):
-                        step.status = StepStatus.READY
-                        step.run_at = 0.0
-                        self._store.update_step(step)
-                        _trace(
-                            "step_recovered",
-                            job_id=job.id,
-                            step=step.key,
-                            status=step.status.value,
-                            basis="process restart; no success result, reschedule",
-                            attempt=step.attempt,
-                        )
-                self._spawn(job.id)
-                recovered += 1
-        _trace("engine_started", recovered_jobs=recovered)
+            if job.status in JOB_TERMINAL:
+                continue
+            # 预算在停机期间已经走完：直接落到终态，不重建调度器、
+            # 不再执行任何步骤。若取消请求先于预算到点，与运行期仲裁
+            # 规则一致地落 CANCELLED，否则落 TIMED_OUT。
+            if job.deadline_at is not None and time.time() >= job.deadline_at:
+                cancel_first = job.cancel_requested and (
+                    job.cancel_requested_at or 0.0
+                ) <= job.deadline_at
+                self._finalize_recovery_terminal(job, cancelled=cancel_first)
+                expired += 1
+                continue
+            # 崩溃恢复：进程中断时 RUNNING 的尝试不算成功结果，
+            # 重置为 READY 继续调度（attempt 保留，退避到点立即跑）。
+            for step in self._store.list_steps(job.id):
+                if step.status in (StepStatus.RUNNING, StepStatus.RETRYING):
+                    step.status = StepStatus.READY
+                    step.run_at = 0.0
+                    self._store.update_step(step)
+                    _trace(
+                        "step_recovered",
+                        job_id=job.id,
+                        step=step.key,
+                        status=step.status.value,
+                        basis="process restart; no success result, reschedule",
+                        attempt=step.attempt,
+                    )
+            self._spawn(job.id)
+            recovered += 1
+        _trace("engine_started", recovered_jobs=recovered, expired_jobs=expired)
+
+    def _finalize_recovery_terminal(self, job: JobState, *, cancelled: bool) -> None:
+        """重启时发现预算已过期：原地清扫为终态（与运行期清扫同语义）。
+
+        cancelled=True 表示取消请求先于预算到点，落 CANCELLED；
+        否则落 TIMED_OUT（budget_exhausted）。
+        """
+        now = time.time()
+        step_status = StepStatus.CANCELLED if cancelled else StepStatus.TIMED_OUT
+        fail_reason = "cancelled" if cancelled else "budget_exhausted"
+        event = "step_cancelled" if cancelled else "step_timed_out"
+        for step in self._store.list_steps(job.id):
+            if step.status in STEP_TERMINAL:
+                continue
+            step.status = step_status
+            step.fail_reason = fail_reason
+            step.error = (
+                "cancelled before completion"
+                if cancelled
+                else "job time budget exhausted before step completed"
+            )
+            step.finished_at = now
+            self._store.update_step(step)
+            _trace(
+                event,
+                job_id=job.id,
+                step=step.key,
+                status=step.status.value,
+                basis="finalized on recovery after downtime",
+                deadline_at=job.deadline_at,
+            )
+        if cancelled:
+            job.status = JobStatus.CANCELLED
+            job.error = "cancelled by request"
+            job_event = "job_cancelled"
+            basis = "cancel requested before deadline; finalized on recovery"
+        else:
+            job.status = JobStatus.TIMED_OUT
+            job.error = (
+                f"budget_exhausted: job time budget of {job.budget_seconds}s "
+                "exhausted (wall clock, incl. downtime)"
+            )
+            job_event = "job_timed_out"
+            basis = "deadline_at already passed at engine start"
+        self._store.update_job(job)
+        _trace(
+            job_event,
+            job_id=job.id,
+            status=job.status.value,
+            basis=basis,
+            budget_seconds=job.budget_seconds,
+            deadline_at=job.deadline_at,
+        )
 
     async def stop(self) -> None:
         # 先撤销所有在途步骤任务（模拟进程退出；未完成尝试将在重启后重调度），
@@ -545,11 +691,19 @@ class WorkflowEngine:
         idempotency_key: str | None,
         max_concurrency: int,
         request_payload: dict[str, Any] | None = None,
+        budget_seconds: float | None = None,
     ) -> JobState:
         if not self._started:
             await self.start()
         validate_specs(specs)
-        payload = request_payload or canonical_request(specs, max_concurrency)
+        if budget_seconds is not None and budget_seconds <= 0:
+            raise WorkflowError(
+                RejectReason.INVALID_DEPENDENCY,
+                "budget_seconds must be positive",
+            )
+        payload = request_payload or canonical_request(
+            specs, max_concurrency, budget_seconds
+        )
 
         async with self._lock:
             if idempotency_key is not None:
@@ -576,12 +730,20 @@ class WorkflowEngine:
                     )
                     return existing
 
+            accepted_at = time.time()
             job = JobState(
                 id=uuid.uuid4().hex[:12],
                 idempotency_key=idempotency_key,
                 status=JobStatus.PENDING,
                 max_concurrency=max_concurrency,
                 request_payload=payload,
+                created_at=accepted_at,
+                budget_seconds=budget_seconds,
+                # 墙钟到期点：接受时刻 + 预算。落盘后跨重启连续计时，
+                # 停机期间的时间自然计入（重启时比较 now 与 deadline_at）。
+                deadline_at=(
+                    accepted_at + budget_seconds if budget_seconds is not None else None
+                ),
             )
             self._store.create_job(job, specs)
             _trace(
@@ -590,6 +752,8 @@ class WorkflowEngine:
                 idempotency_key=idempotency_key,
                 steps=[s.key for s in specs],
                 max_concurrency=max_concurrency,
+                budget_seconds=budget_seconds,
+                deadline_at=job.deadline_at,
             )
             self._spawn(job.id)
             return job
@@ -598,23 +762,26 @@ class WorkflowEngine:
         job = self._store.get_job(job_id)
         if job is None:
             raise WorkflowError(RejectReason.JOB_NOT_FOUND, f"unknown job: {job_id}")
-        if job.status in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED):
+        # 定向 UPDATE：仅在非终态时落 cancel_requested + 请求时刻，
+        # 不触碰状态列，避免与调度器的终态写互相覆盖。
+        requested_at = time.time()
+        updated = self._store.try_set_cancel_requested(job_id, requested_at)
+        if updated is None:
             raise WorkflowError(
                 RejectReason.JOB_ALREADY_TERMINAL,
                 f"job already terminal: {job.status.value}",
             )
-        job.cancel_requested = True
-        self._store.update_job(job)
         _trace(
             "cancel_requested",
             job_id=job_id,
             basis="client cancel request accepted",
+            cancel_requested_at=requested_at,
         )
         entry = self._runners.get(job_id)
         if entry is not None:
             async with entry[2]:
                 entry[2].notify_all()
-        return job
+        return updated
 
     def get_job_state(self, job_id: str) -> JobState | None:
         return self._store.get_job(job_id)
