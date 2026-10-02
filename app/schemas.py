@@ -35,6 +35,8 @@ class StepIn(BaseModel):
 class JobSubmitIn(BaseModel):
     idempotency_key: str | None = None
     max_concurrency: int = Field(default=2, ge=1)
+    # 作业整体时间预算（秒，墙钟）；缺省/None 表示不设预算，行为与历史完全一致。
+    time_budget_seconds: float | None = Field(default=None, gt=0)
     steps: list[StepIn] = Field(min_length=1)
 
 
@@ -55,6 +57,8 @@ class JobOut(BaseModel):
     cancel_requested: bool
     max_concurrency: int
     error: str | None = None
+    time_budget_seconds: float | None = None
+    budget_deadline: float | None = None
     steps: list[StepOut]
 
     @classmethod
@@ -66,6 +70,8 @@ class JobOut(BaseModel):
             cancel_requested=job.cancel_requested,
             max_concurrency=job.max_concurrency,
             error=job.error,
+            time_budget_seconds=job.time_budget_seconds,
+            budget_deadline=job.budget_deadline,
             steps=[
                 StepOut(
                     key=s.key,

@@ -13,8 +13,15 @@
    等待至 run_at；attempt 超过 max_attempts -> FAILED（fail_reason=retry_exhausted）。
 4. 取消：cancel() 落 cancel_requested 后唤醒调度器，所有未在终态的步骤
    被标记 CANCELLED，运行中的任务收到 CancelledError；作业 -> CANCELLED。
-5. 重启恢复：start() 时扫描存储，所有非终态作业重新装载并调度；
-   SUCCEEDED 步骤原样保留绝不重跑，RUNNING/RETRYING/PENDING/READY 继续调度。
+5. 整体时间预算：提交时可带 time_budget_seconds（墙钟秒）。预算自作业被
+   接受起按 time.time() 扣减，截止点 budget_deadline 以绝对时间戳持久化。
+   截止点到（含重启时发现其已在过去）时，所有未终态步骤 -> TIMED_OUT
+   (fail_reason=budget_exhausted)，已成功结果保留，作业 -> TIMED_OUT；
+   退避/排队中的步骤不再被放行。取消判定先于预算判定（先取消后到点稳定
+   为 CANCELLED）；终态不可变更。
+6. 重启恢复：start() 时扫描存储，预算已耗尽的非终态作业直接落 TIMED_OUT，
+   其余非终态作业重新装载并调度；SUCCEEDED 步骤原样保留绝不重跑，
+   RUNNING/RETRYING/PENDING/READY 继续调度。
 
 线程/并发模型：FastAPI 的 async 处理器与引擎运行在同一事件循环；
 SQLite 调用耗时极短（本地文件），直接在事件循环中调用并由 store 内锁保护。
@@ -32,8 +39,13 @@ from typing import Any
 from app.executor import StepExecutionError, StepExecutor
 from app.models import (
     CancellationError,
+    FAIL_REASON_BUDGET_EXHAUSTED,
+    FAIL_REASON_CANCELLED,
+    FAIL_REASON_RETRY_EXHAUSTED,
+    FAIL_REASON_UPSTREAM_FAILED,
     JobState,
     JobStatus,
+    JOB_TERMINAL,
     RejectReason,
     STEP_FAILING,
     STEP_TERMINAL,
@@ -79,10 +91,15 @@ def _trace(event: str, **fields: Any) -> None:
         sink(event, fields)
 
 
-def canonical_request(specs: list[StepSpec], max_concurrency: int) -> dict[str, Any]:
+def canonical_request(
+    specs: list[StepSpec],
+    max_concurrency: int,
+    time_budget_seconds: float | None = None,
+) -> dict[str, Any]:
     """规范化请求体（不含幂等键），用于幂等一致性判定。"""
     return {
         "max_concurrency": max_concurrency,
+        "time_budget_seconds": time_budget_seconds,
         "steps": [s.request_payload() for s in specs],
     }
 
@@ -147,6 +164,8 @@ class _JobRunner:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stop = False
         self._shutting_down = False
+        # True 表示在途任务被撤销是因为预算耗尽（区别于引擎关闭与人工取消）
+        self._budget_timeout = False
 
     # ---------- 持久化 + trace 的小工具 ----------
     def _job(self) -> JobState:
@@ -190,9 +209,15 @@ class _JobRunner:
                     return
                 # Condition.notify 不会因“早于等待”而丢失；
                 # 另用 0.05s 超时兜底重试退避到点（run_at）的步骤。
+                # 有整体预算时，等待时长额外被“距预算截止的剩余时间”封顶，
+                # 保证预算一到点最迟在同一切片内被扫到。
+                timeout = 0.05
+                latest = self._job()
+                if latest.budget_deadline is not None:
+                    timeout = max(0.0, min(timeout, latest.budget_deadline - time.time()))
                 async with self._cond:
                     try:
-                        await asyncio.wait_for(self._cond.wait(), timeout=0.05)
+                        await asyncio.wait_for(self._cond.wait(), timeout=timeout)
                     except asyncio.TimeoutError:
                         pass
         finally:
@@ -201,7 +226,7 @@ class _JobRunner:
     async def _tick(self) -> bool:
         """执行一轮调度决策。返回 True 表示作业已到终态。"""
         job = self._job()
-        if job.status in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED):
+        if job.status in JOB_TERMINAL:
             return True
 
         steps = self._steps()
@@ -214,6 +239,19 @@ class _JobRunner:
             await self._propagate_cancel(job, steps)
             return True
 
+        # 2) 整体时间预算：预算到点且仍有未终态步骤时立即收尾。
+        #    排在取消之后，因此同一 tick 两者同时挂起时取消优先
+        #    （“先取消后预算到点”稳定为 CANCELLED）。
+        #    若全部步骤恰好已终态（预算到点“到达太晚”），不做收尾扫描，
+        #    交给终态归并判定（全 SUCCEEDED -> SUCCEEDED）。
+        if (
+            job.budget_deadline is not None
+            and time.time() >= job.budget_deadline
+            and any(s.status not in STEP_TERMINAL for s in steps.values())
+        ):
+            await self._propagate_budget_timeout(job, steps)
+            return True
+
         # 2) 依赖判定：失败上游 -> BLOCKED；满足依赖 -> READY
         progress = False
         for step in steps.values():
@@ -222,7 +260,7 @@ class _JobRunner:
             dep_states = [steps[d].status for d in step.spec.depends_on]
             if any(x in STEP_FAILING for x in dep_states):
                 step.status = StepStatus.BLOCKED
-                step.fail_reason = "upstream_failed"
+                step.fail_reason = FAIL_REASON_UPSTREAM_FAILED
                 step.error = (
                     "blocked: upstream step "
                     + ",".join(
@@ -253,10 +291,15 @@ class _JobRunner:
         if progress:
             steps = self._steps()
 
-        # 3) 启动到点的 READY/RETRYING 步骤（受并发信号量约束）
+        # 3) 启动到点的 READY/RETRYING 步骤（受并发信号量约束）。
+        #    预算已耗尽时不得再放行：排队等槽位的步骤、退避等到点的步骤
+        #    都不会再跑，统一由下一次 tick 的预算扫描收尾。
         now = time.time()
+        budget_alive = job.budget_deadline is None or now < job.budget_deadline
         for step in steps.values():
             if step.key in self._tasks:
+                continue
+            if not budget_alive:
                 continue
             if step.status == StepStatus.READY or (
                 step.status == StepStatus.RETRYING and now >= step.run_at
@@ -278,9 +321,11 @@ class _JobRunner:
         if not all(s.status in STEP_TERMINAL for s in steps.values()):
             return False
         job = self._job()
-        # 归并顺序需消除“取消与收尾同时发生”的竞态歧义：
-        # 若所有步骤都已 SUCCEEDED，则作业视为成功（取消到达得太晚）；
-        # 否则只要存在被取消的步骤或取消请求，即为 CANCELLED。
+        # 归并顺序需消除“收尾信号与自然完成同时发生”的竞态歧义：
+        # 1) 若所有步骤都已 SUCCEEDED，则作业视为成功（取消/预算到点到达得太晚）；
+        # 2) 否则人工取消优先（cancel_requested 或存在 CANCELLED 步骤）；
+        # 3) 否则预算耗尽（TIMED_OUT 步骤只可能来自预算收尾扫描）；
+        # 4) 其余按失败归并。
         if all(s.status == StepStatus.SUCCEEDED for s in steps.values()):
             job.status = JobStatus.SUCCEEDED
             self._save_job(job, "job_succeeded", basis="all steps succeeded")
@@ -292,6 +337,13 @@ class _JobRunner:
                 job,
                 "job_cancelled",
                 basis="cancel requested propagated to unfinished steps",
+            )
+        elif any(s.status is StepStatus.TIMED_OUT for s in steps.values()):
+            job.status = JobStatus.TIMED_OUT
+            self._save_job(
+                job,
+                "job_timed_out",
+                basis="wall-clock time budget exhausted before all steps finished",
             )
         else:
             job.status = JobStatus.FAILED
@@ -311,7 +363,7 @@ class _JobRunner:
         self._stop = True
         return True
 
-    # ---------- 取消 ----------
+    # ---------- 取消 / 时间预算收尾 ----------
     async def _propagate_cancel(
         self, job: JobState, steps: dict[str, StepState]
     ) -> None:
@@ -320,7 +372,7 @@ class _JobRunner:
             if step.status in STEP_TERMINAL:
                 continue
             step.status = StepStatus.CANCELLED
-            step.fail_reason = "cancelled"
+            step.fail_reason = FAIL_REASON_CANCELLED
             step.error = "cancelled before completion"
             step.finished_at = time.time()
             self._save_step(
@@ -331,6 +383,52 @@ class _JobRunner:
         job.status = JobStatus.CANCELLED
         job.error = "cancelled by request"
         self._save_job(job, "job_cancelled", basis="cancel propagation sweep")
+        for t in running:
+            t.cancel()
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+        self._stop = True
+
+    async def _propagate_budget_timeout(
+        self, job: JobState, steps: dict[str, StepState]
+    ) -> None:
+        """预算耗尽收尾：未终态步骤统一 TIMED_OUT，运行中任务被撤销。
+
+        已 SUCCEEDED/FAILED/BLOCKED/CANCELLED/TIMED_OUT 的步骤原样保留；
+        下游不会被静默跳过——全部进入显式 TIMED_OUT 终态。
+        """
+        assert job.budget_deadline is not None
+        elapsed = time.time() - job.created_at
+        running = [t for k, t in self._tasks.items() if not t.done()]
+        self._budget_timeout = True
+        for step in steps.values():
+            if step.status in STEP_TERMINAL:
+                continue
+            step.status = StepStatus.TIMED_OUT
+            step.fail_reason = FAIL_REASON_BUDGET_EXHAUSTED
+            step.error = (
+                f"timed out: job wall-clock budget "
+                f"{job.time_budget_seconds}s exhausted"
+            )
+            step.finished_at = time.time()
+            self._save_step(
+                step,
+                "step_timed_out",
+                basis="job budget deadline reached while step unfinished",
+                deadline=job.budget_deadline,
+                elapsed=round(elapsed, 6),
+            )
+        job.status = JobStatus.TIMED_OUT
+        job.error = (
+            f"timed out: wall-clock budget {job.time_budget_seconds}s exhausted"
+        )
+        self._save_job(
+            job,
+            "job_timed_out",
+            basis="budget timeout propagation sweep",
+            deadline=job.budget_deadline,
+            elapsed=round(elapsed, 6),
+        )
         for t in running:
             t.cancel()
         if running:
@@ -358,11 +456,14 @@ class _JobRunner:
 
     async def _execute_with_retry(self, key: str) -> None:
         step = self._steps()[key]
-        # 进入执行前的并发槽内二次检查（可能已被取消/阻断）
+        # 进入执行前的并发槽内二次检查（可能已被取消/阻断/预算收尾）
         if step.status in STEP_TERMINAL:
             return
         job = self._job()
         if job.cancel_requested:
+            return
+        # 并发槽可能恰好等到预算耗尽才拿到：此时不得再发起一次尝试
+        if job.budget_deadline is not None and time.time() >= job.budget_deadline:
             return
 
         is_retry = step.status == StepStatus.RETRYING
@@ -388,11 +489,15 @@ class _JobRunner:
                 # 引擎关闭模拟进程中断：不落 CANCELLED，保留 RUNNING/RETRYING，
                 # 交由下次启动时的 step_recovered 重调度。
                 raise
+            if self._budget_timeout:
+                # 预算收尾扫描已把该步骤落为 TIMED_OUT，无需再改状态
+                await self._notify()
+                raise
             # 作业取消：交由调度循环统一标记 CANCELLED（若尚未标记）
             latest = self._steps()[key]
             if latest.status not in STEP_TERMINAL:
                 latest.status = StepStatus.CANCELLED
-                latest.fail_reason = "cancelled"
+                latest.fail_reason = FAIL_REASON_CANCELLED
                 latest.error = "cancelled during execution"
                 latest.finished_at = time.time()
                 self._save_step(
@@ -427,7 +532,7 @@ class _JobRunner:
         step.error = f"{exc.reason}: {exc.message}"
         if step.attempt >= step.spec.max_attempts:
             step.status = StepStatus.FAILED
-            step.fail_reason = "retry_exhausted"
+            step.fail_reason = FAIL_REASON_RETRY_EXHAUSTED
             step.finished_at = time.time()
             self._save_step(
                 step,
@@ -477,30 +582,127 @@ class WorkflowEngine:
             return
         self._started = True
         recovered = 0
+        timed_out_on_recovery = 0
+        cancelled_on_recovery = 0
+        now = time.time()
         for job in self._store.list_all_jobs():
-            if job.status not in (
-                JobStatus.SUCCEEDED,
-                JobStatus.FAILED,
-                JobStatus.CANCELLED,
-            ):
-                # 崩溃恢复：进程中断时 RUNNING 的尝试不算成功结果，
-                # 重置为 READY 继续调度（attempt 保留，退避到点立即跑）。
-                for step in self._store.list_steps(job.id):
-                    if step.status in (StepStatus.RUNNING, StepStatus.RETRYING):
-                        step.status = StepStatus.READY
-                        step.run_at = 0.0
-                        self._store.update_step(step)
-                        _trace(
-                            "step_recovered",
-                            job_id=job.id,
-                            step=step.key,
-                            status=step.status.value,
-                            basis="process restart; no success result, reschedule",
-                            attempt=step.attempt,
-                        )
+            if job.status in JOB_TERMINAL:
+                continue
+            steps = self._store.list_steps(job.id)
+            unfinished = [s for s in steps if s.status not in STEP_TERMINAL]
+            # 停机恢复第一判定：取消意图先于预算（与运行期 tick 顺序一致）。
+            # 取消信号在崩溃前已持久化、但尚未完成传播扫描时，重启后仍要
+            # 兑现 CANCELLED，即使停机期间预算也已经到点。
+            if job.cancel_requested and unfinished:
+                self._finalize_cancel_on_recovery(job, steps, now)
+                cancelled_on_recovery += 1
+                continue
+            # 停机恢复第二判定：预算按墙钟照扣。若重启时预算早已走完
+            # （含停机这段时间跨过截止点），作业直接落 TIMED_OUT 终态，
+            # 绝不重新调度任何步骤。
+            if job.budget_deadline is not None and now >= job.budget_deadline:
+                if unfinished:
+                    self._finalize_budget_timeout_on_recovery(job, now)
+                    timed_out_on_recovery += 1
+                    continue
+                # 全部步骤恰好已终态（预算到点太晚）：重建调度器，让首轮
+                # tick 的终态归并按步骤现状定论（全 SUCCEEDED -> SUCCEEDED）。
                 self._spawn(job.id)
                 recovered += 1
-        _trace("engine_started", recovered_jobs=recovered)
+                continue
+            # 崩溃恢复：进程中断时 RUNNING 的尝试不算成功结果，
+            # 重置为 READY 继续调度（attempt 保留，退避到点立即跑）。
+            for step in steps:
+                if step.status in (StepStatus.RUNNING, StepStatus.RETRYING):
+                    step.status = StepStatus.READY
+                    step.run_at = 0.0
+                    self._store.update_step(step)
+                    _trace(
+                        "step_recovered",
+                        job_id=job.id,
+                        step=step.key,
+                        status=step.status.value,
+                        basis="process restart; no success result, reschedule",
+                        attempt=step.attempt,
+                    )
+            self._spawn(job.id)
+            recovered += 1
+        _trace(
+            "engine_started",
+            recovered_jobs=recovered,
+            timed_out_on_recovery=timed_out_on_recovery,
+            cancelled_on_recovery=cancelled_on_recovery,
+        )
+
+    def _finalize_cancel_on_recovery(
+        self, job: JobState, steps: list[StepState], now: float
+    ) -> None:
+        """恢复路径的取消收尾：兑现崩溃前已持久化的取消意图。"""
+        for step in steps:
+            if step.status in STEP_TERMINAL:
+                continue
+            step.status = StepStatus.CANCELLED
+            step.fail_reason = FAIL_REASON_CANCELLED
+            step.error = "cancelled before completion (finalized on recovery)"
+            step.finished_at = now
+            self._store.update_step(step)
+            _trace(
+                "step_cancelled",
+                job_id=job.id,
+                step=step.key,
+                status=step.status.value,
+                basis="cancel_requested persisted before crash; finalized on restart",
+            )
+        job.status = JobStatus.CANCELLED
+        job.error = "cancelled by request"
+        self._store.update_job(job)
+        _trace(
+            "job_cancelled",
+            job_id=job.id,
+            status=job.status.value,
+            cancel_requested=job.cancel_requested,
+            basis="cancel intent survived restart; takes precedence over budget",
+        )
+
+    def _finalize_budget_timeout_on_recovery(self, job: JobState, now: float) -> None:
+        """恢复路径的预算收尾：不重建调度器，直接把未终态步骤与作业落终态。"""
+        steps = self._store.list_steps(job.id)
+        elapsed = now - job.created_at
+        for step in steps:
+            if step.status in STEP_TERMINAL:
+                continue
+            step.status = StepStatus.TIMED_OUT
+            step.fail_reason = FAIL_REASON_BUDGET_EXHAUSTED
+            step.error = (
+                f"timed out: job wall-clock budget "
+                f"{job.time_budget_seconds}s exhausted during downtime"
+            )
+            step.finished_at = now
+            self._store.update_step(step)
+            _trace(
+                "step_timed_out",
+                job_id=job.id,
+                step=step.key,
+                status=step.status.value,
+                basis="budget already exhausted before process restarted",
+                deadline=job.budget_deadline,
+                elapsed=round(elapsed, 6),
+            )
+        job.status = JobStatus.TIMED_OUT
+        job.error = (
+            f"timed out: wall-clock budget {job.time_budget_seconds}s exhausted "
+            f"before restart"
+        )
+        self._store.update_job(job)
+        _trace(
+            "job_timed_out",
+            job_id=job.id,
+            status=job.status.value,
+            cancel_requested=job.cancel_requested,
+            basis="deadline already in the past on recovery; no step rescheduled",
+            deadline=job.budget_deadline,
+            elapsed=round(elapsed, 6),
+        )
 
     async def stop(self) -> None:
         # 先撤销所有在途步骤任务（模拟进程退出；未完成尝试将在重启后重调度），
@@ -544,12 +746,20 @@ class WorkflowEngine:
         specs: list[StepSpec],
         idempotency_key: str | None,
         max_concurrency: int,
+        time_budget_seconds: float | None = None,
         request_payload: dict[str, Any] | None = None,
     ) -> JobState:
         if not self._started:
             await self.start()
         validate_specs(specs)
-        payload = request_payload or canonical_request(specs, max_concurrency)
+        if time_budget_seconds is not None and time_budget_seconds <= 0:
+            raise WorkflowError(
+                RejectReason.INVALID_DEPENDENCY,
+                "time_budget_seconds must be positive",
+            )
+        payload = request_payload or canonical_request(
+            specs, max_concurrency, time_budget_seconds
+        )
 
         async with self._lock:
             if idempotency_key is not None:
@@ -576,13 +786,25 @@ class WorkflowEngine:
                     )
                     return existing
 
+            accepted_at = time.time()
+            deadline = (
+                accepted_at + time_budget_seconds
+                if time_budget_seconds is not None
+                else None
+            )
             job = JobState(
                 id=uuid.uuid4().hex[:12],
                 idempotency_key=idempotency_key,
                 status=JobStatus.PENDING,
                 max_concurrency=max_concurrency,
                 request_payload=payload,
+                time_budget_seconds=time_budget_seconds,
+                # 预算从作业被接受开始按墙钟扣：截止点以绝对时间戳持久化，
+                # 使“已用时间”跨进程重启接着扣（停机时间照扣）。
+                budget_deadline=deadline,
             )
+            job.created_at = accepted_at
+            job.updated_at = accepted_at
             self._store.create_job(job, specs)
             _trace(
                 "job_created",
@@ -590,6 +812,9 @@ class WorkflowEngine:
                 idempotency_key=idempotency_key,
                 steps=[s.key for s in specs],
                 max_concurrency=max_concurrency,
+                time_budget_seconds=time_budget_seconds,
+                budget_deadline=deadline,
+                basis="budget measured in wall-clock seconds from acceptance",
             )
             self._spawn(job.id)
             return job
@@ -598,7 +823,9 @@ class WorkflowEngine:
         job = self._store.get_job(job_id)
         if job is None:
             raise WorkflowError(RejectReason.JOB_NOT_FOUND, f"unknown job: {job_id}")
-        if job.status in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED):
+        if job.status in JOB_TERMINAL:
+            # 终态不可变更：SUCCEEDED/FAILED/CANCELLED/TIMED_OUT 均返回 409，
+            # “已超预算后再取消”不会把 TIMED_OUT 搅成别的状态。
             raise WorkflowError(
                 RejectReason.JOB_ALREADY_TERMINAL,
                 f"job already terminal: {job.status.value}",

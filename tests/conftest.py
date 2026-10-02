@@ -48,7 +48,10 @@ async def engine(db_path):
             head = f"{r['event']}"
             ctx = []
             for k in ("job_id", "step", "status", "attempt", "basis", "reason",
-                      "backoff_seconds", "next_attempt", "idempotency_key"):
+                      "backoff_seconds", "next_attempt", "idempotency_key",
+                      "time_budget_seconds", "budget_deadline", "deadline",
+                      "elapsed", "timed_out_on_recovery", "recovered_jobs",
+                      "cancelled_on_recovery"):
                 if k in r:
                     ctx.append(f"{k}={r[k]}")
             print(f"  {head}: " + " ".join(str(c) for c in ctx))

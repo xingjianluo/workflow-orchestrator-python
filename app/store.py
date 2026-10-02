@@ -17,15 +17,17 @@ from app.models import JobState, JobStatus, StepSpec, StepState, StepStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
-    id               TEXT PRIMARY KEY,
-    idempotency_key  TEXT UNIQUE,
-    status           TEXT NOT NULL,
-    max_concurrency  INTEGER NOT NULL,
-    cancel_requested INTEGER NOT NULL DEFAULT 0,
-    created_at       REAL NOT NULL,
-    updated_at       REAL NOT NULL,
-    error            TEXT,
-    request_payload  TEXT
+    id                  TEXT PRIMARY KEY,
+    idempotency_key     TEXT UNIQUE,
+    status              TEXT NOT NULL,
+    max_concurrency     INTEGER NOT NULL,
+    cancel_requested    INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    error               TEXT,
+    request_payload     TEXT,
+    time_budget_seconds REAL,
+    budget_deadline     REAL
 );
 CREATE TABLE IF NOT EXISTS steps (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,6 +46,14 @@ CREATE TABLE IF NOT EXISTS steps (
 );
 CREATE INDEX IF NOT EXISTS idx_steps_job ON steps(job_id);
 """
+
+# 老版本数据库的轻量列迁移：缺列则补（SQLite 的 ADD COLUMN 只能追加，语义足够）
+_MIGRATIONS = {
+    "jobs": {
+        "time_budget_seconds": "REAL",
+        "budget_deadline": "REAL",
+    },
+}
 
 
 def _spec_to_json(spec: StepSpec) -> str:
@@ -107,6 +117,20 @@ class JobStore:
     def init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """对已有数据库补齐新增列（幂等）。"""
+        for table, columns in _MIGRATIONS.items():
+            existing = {
+                r["name"]
+                for r in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            for name, decl in columns.items():
+                if name not in existing:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {decl}"
+                    )
 
     def close(self) -> None:
         with self._lock:
@@ -119,8 +143,9 @@ class JobStore:
             try:
                 self._conn.execute(
                     """INSERT INTO jobs(id, idempotency_key, status, max_concurrency,
-                       cancel_requested, created_at, updated_at, error, request_payload)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                       cancel_requested, created_at, updated_at, error, request_payload,
+                       time_budget_seconds, budget_deadline)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         job.id,
                         job.idempotency_key,
@@ -131,6 +156,8 @@ class JobStore:
                         job.updated_at,
                         job.error,
                         _dumps(job.request_payload),
+                        job.time_budget_seconds,
+                        job.budget_deadline,
                     ),
                 )
                 for spec in specs:
@@ -169,6 +196,8 @@ class JobStore:
             updated_at=row["updated_at"],
             error=row["error"],
             request_payload=_loads(row["request_payload"]),
+            time_budget_seconds=row["time_budget_seconds"],
+            budget_deadline=row["budget_deadline"],
         )
 
     def get_job(self, job_id: str) -> JobState | None:
@@ -190,7 +219,8 @@ class JobStore:
         with self._lock:
             self._conn.execute(
                 """UPDATE jobs SET status=?, max_concurrency=?, cancel_requested=?,
-                   updated_at=?, error=?, request_payload=? WHERE id=?""",
+                   updated_at=?, error=?, request_payload=?,
+                   time_budget_seconds=?, budget_deadline=? WHERE id=?""",
                 (
                     job.status.value,
                     int(job.max_concurrency),
@@ -198,6 +228,8 @@ class JobStore:
                     job.updated_at,
                     job.error,
                     _dumps(job.request_payload),
+                    job.time_budget_seconds,
+                    job.budget_deadline,
                     job.id,
                 ),
             )

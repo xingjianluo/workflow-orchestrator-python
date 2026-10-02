@@ -39,6 +39,7 @@ def build_router(get_engine) -> APIRouter:
                 specs=specs,
                 idempotency_key=payload.idempotency_key,
                 max_concurrency=payload.max_concurrency,
+                time_budget_seconds=payload.time_budget_seconds,
             )
         except WorkflowError as exc:
             raise _http_for(exc) from exc
