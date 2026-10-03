@@ -11,17 +11,21 @@
    - 任一依赖进入 FAILED/BLOCKED/CANCELLED，步骤立刻 BLOCKED（fail_reason=upstream_failed）。
 3. 重试：可重试异常按指数退避（backoff_base*2**(attempt-1)，上限 backoff_cap）
    等待至 run_at；attempt 超过 max_attempts -> FAILED（fail_reason=retry_exhausted）。
-4. 取消：cancel() 落 cancel_requested 后唤醒调度器，所有未在终态的步骤
-   被标记 CANCELLED，运行中的任务收到 CancelledError；作业 -> CANCELLED。
+4. 取消：cancel() 落 cancel_requested（连同接受时刻 cancel_requested_at）
+   后唤醒调度器，所有未在终态的步骤被标记 CANCELLED，运行中的任务收到
+   CancelledError；作业 -> CANCELLED。预算截止点已过的取消请求按冲突拒绝
+   （409 job_already_terminal），不落取消标记。
 5. 整体时间预算：提交时可带 time_budget_seconds（墙钟秒）。预算自作业被
    接受起按 time.time() 扣减，截止点 budget_deadline 以绝对时间戳持久化。
    截止点到（含重启时发现其已在过去）时，所有未终态步骤 -> TIMED_OUT
    (fail_reason=budget_exhausted)，已成功结果保留，作业 -> TIMED_OUT；
-   退避/排队中的步骤不再被放行。取消判定先于预算判定（先取消后到点稳定
-   为 CANCELLED）；终态不可变更。
-6. 重启恢复：start() 时扫描存储，预算已耗尽的非终态作业直接落 TIMED_OUT，
-   其余非终态作业重新装载并调度；SUCCEEDED 步骤原样保留绝不重跑，
-   RUNNING/RETRYING/PENDING/READY 继续调度。
+   退避/排队中的步骤不再被放行。取消与预算到点的先后按真实发生时刻判定
+   （cancel_requested_at < budget_deadline 时取消优先，否则预算优先），
+   运行期与重启恢复一致；终态不可变更。
+6. 重启恢复：start() 时扫描存储，预算已耗尽的非终态作业直接落 TIMED_OUT
+   （取消标记是在预算到点之后才落盘的也落 TIMED_OUT），取消先于预算到点
+   的落 CANCELLED，其余非终态作业重新装载并调度；SUCCEEDED 步骤原样保留
+   绝不重跑，RUNNING/RETRYING/PENDING/READY 继续调度。
 
 线程/并发模型：FastAPI 的 async 处理器与引擎运行在同一事件循环；
 SQLite 调用耗时极短（本地文件），直接在事件循环中调用并由 store 内锁保护。
@@ -89,6 +93,24 @@ def _trace(event: str, **fields: Any) -> None:
     sink = _trace_var.get()
     if sink is not None:
         sink(event, fields)
+
+
+def _cancel_beats_budget(job: JobState) -> bool:
+    """取消与预算到点的先后判定：按真实发生的墙钟先后，而非处理顺序。
+
+    取消优先当且仅当取消请求被接受的时刻（cancel_requested_at，随取消意图
+    一起持久化）早于预算截止点；否则预算优先。因此“预算先到点、取消后到”
+    无论运行期还是跨重启都稳定落 TIMED_OUT，不会被取消标记改写。
+    老库数据没有取消时间戳（cancel_requested_at 为 None）时保持历史行为：
+    取消优先。
+    """
+    if not job.cancel_requested:
+        return False
+    if job.budget_deadline is None:
+        return True
+    if job.cancel_requested_at is None:
+        return True  # 老数据无法判定先后，维持修复前的语义
+    return job.cancel_requested_at < job.budget_deadline
 
 
 def canonical_request(
@@ -233,7 +255,11 @@ class _JobRunner:
 
         # 1) 取消传播：仍有未终态步骤时才扫描取消；
         #    若全部步骤恰好已终态（取消到达太晚），交给终态归并判定。
-        if job.cancel_requested and any(
+        #    取消优先的前提是“取消真实发生在预算到点之前”
+        #    （_cancel_beats_budget 按持久化的取消时间戳判定）；
+        #    预算先到点的取消请求不会被接受，即便取消标记因故已落盘，
+        #    这里也会让位给下面的预算收尾，稳定落 TIMED_OUT。
+        if _cancel_beats_budget(job) and any(
             s.status not in STEP_TERMINAL for s in steps.values()
         ):
             await self._propagate_cancel(job, steps)
@@ -323,13 +349,13 @@ class _JobRunner:
         job = self._job()
         # 归并顺序需消除“收尾信号与自然完成同时发生”的竞态歧义：
         # 1) 若所有步骤都已 SUCCEEDED，则作业视为成功（取消/预算到点到达得太晚）；
-        # 2) 否则人工取消优先（cancel_requested 或存在 CANCELLED 步骤）；
+        # 2) 否则人工取消优先（取消真实发生在预算到点之前，或已存在 CANCELLED 步骤）；
         # 3) 否则预算耗尽（TIMED_OUT 步骤只可能来自预算收尾扫描）；
         # 4) 其余按失败归并。
         if all(s.status == StepStatus.SUCCEEDED for s in steps.values()):
             job.status = JobStatus.SUCCEEDED
             self._save_job(job, "job_succeeded", basis="all steps succeeded")
-        elif job.cancel_requested or any(
+        elif _cancel_beats_budget(job) or any(
             s.status is StepStatus.CANCELLED for s in steps.values()
         ):
             job.status = JobStatus.CANCELLED
@@ -590,10 +616,13 @@ class WorkflowEngine:
                 continue
             steps = self._store.list_steps(job.id)
             unfinished = [s for s in steps if s.status not in STEP_TERMINAL]
-            # 停机恢复第一判定：取消意图先于预算（与运行期 tick 顺序一致）。
-            # 取消信号在崩溃前已持久化、但尚未完成传播扫描时，重启后仍要
-            # 兑现 CANCELLED，即使停机期间预算也已经到点。
-            if job.cancel_requested and unfinished:
+            # 停机恢复第一判定：取消意图先于预算，但仅以“取消真实发生在
+            # 预算到点之前”为前提（_cancel_beats_budget 按持久化的
+            # cancel_requested_at 与 budget_deadline 比较，与运行期 tick
+            # 的判定一致）。取消标记在预算到点之后才落盘的（例如收尾前
+            # 进程被停掉、标记已写入但传播未执行），重启后不能让取消
+            # 抢走终态，应落入下面的预算判定，稳定为 TIMED_OUT。
+            if unfinished and _cancel_beats_budget(job):
                 self._finalize_cancel_on_recovery(job, steps, now)
                 cancelled_on_recovery += 1
                 continue
@@ -830,12 +859,34 @@ class WorkflowEngine:
                 RejectReason.JOB_ALREADY_TERMINAL,
                 f"job already terminal: {job.status.value}",
             )
+        now = time.time()
+        if job.budget_deadline is not None and now >= job.budget_deadline:
+            # 预算截止点已过、只是收尾尚未落盘（或进程即将重启）：作业等价于
+            # 终态 TIMED_OUT。此时取消请求按冲突拒绝，不落 cancel_requested，
+            # 保证终态稳定为 TIMED_OUT 且跨重启判定一致。
+            _trace(
+                "cancel_rejected",
+                job_id=job_id,
+                reason=RejectReason.JOB_ALREADY_TERMINAL.value,
+                basis="budget deadline already passed; job is effectively terminal",
+                budget_deadline=job.budget_deadline,
+                now=now,
+            )
+            raise WorkflowError(
+                RejectReason.JOB_ALREADY_TERMINAL,
+                "job already terminal: wall-clock budget exhausted",
+            )
         job.cancel_requested = True
+        # 取消被接受的墙钟时刻随意图一起持久化：与 budget_deadline 的比较
+        # 是“谁先谁后”跨重启稳定判定的依据。
+        job.cancel_requested_at = now
         self._store.update_job(job)
         _trace(
             "cancel_requested",
             job_id=job_id,
             basis="client cancel request accepted",
+            cancel_requested_at=now,
+            budget_deadline=job.budget_deadline,
         )
         entry = self._runners.get(job_id)
         if entry is not None:

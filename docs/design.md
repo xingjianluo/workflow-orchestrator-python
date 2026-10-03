@@ -11,8 +11,8 @@
 | PENDING | 首个调度 tick | RUNNING |
 | RUNNING | 全部步骤 SUCCEEDED | SUCCEEDED |
 | RUNNING | 存在步骤 FAILED 或 BLOCKED | FAILED（`error` 汇总归因） |
-| RUNNING/PENDING | `cancel_requested=true` 且仍有未终态步骤 | CANCELLED |
-| RUNNING/PENDING | 墙钟 `time >= budget_deadline` 且仍有未终态步骤 | TIMED_OUT |
+| RUNNING/PENDING | `cancel_requested=true` 且取消发生在预算到点之前（`cancel_requested_at < budget_deadline`）且仍有未终态步骤 | CANCELLED |
+| RUNNING/PENDING | 墙钟 `time >= budget_deadline` 且仍有未终态步骤（取消在到点之后才发生的也归此列） | TIMED_OUT |
 | 任意非终态 | 重启时发现截止点已在过去（含停机期间跨过） | TIMED_OUT（恢复路径直接落终态） |
 | 任意非终态 | 进程重启且预算仍有效 | 状态不变，重建调度器继续推进 |
 | 终态 | 任意事件 | 终态（不可变更，取消返回 `job_already_terminal`） |
@@ -45,9 +45,13 @@
 每个作业一个后台 task（`_JobRunner.run`），循环执行：
 
 1. 若作业终态 → 退出。
-2. 若 `cancel_requested` → 取消传播扫描并终结作业。
+2. 若 `cancel_requested` 且取消真实发生在预算到点之前
+   （`_cancel_beats_budget`：持久化的 `cancel_requested_at < budget_deadline`）
+   → 取消传播扫描并终结作业。
 3. 若带预算且 `time.time() >= budget_deadline` → 预算收尾扫描并终结作业。
-   （取消判定排在预算判定之前，见 §3.1 的撞车规则。）
+   （到点之后才发生的取消不会让位：它在 cancel() 入口即被 409 拒绝，
+   即便取消标记因故已落盘，此处也按时间戳判定让预算收尾优先，
+   见 §3.1 的撞车规则。）
 4. 依赖判定：PENDING 步骤根据依赖状态转 READY 或 BLOCKED（每个决策点立即落库）。
 5. 启动到点的 READY / RETRYING 步骤，受作业级
    `Semaphore(max_concurrency)` 约束；预算已过时**一律不再放行新尝试**
@@ -94,13 +98,17 @@
 ## 3.1 取消与预算撞车的边界规则
 
 两种收尾都是“先持久化意图/事实，再由调度器传播”，终态一经写定不可变更。
-冲突时按下列固定规则归并，保证结果稳定、可解释：
+谁先谁后**按真实发生的墙钟先后判定**，与处理顺序、是否重启无关：取消被
+接受时把接受时刻 `cancel_requested_at` 随意图一起持久化，判定规则为
+`cancel_requested_at < budget_deadline` 时取消优先，否则预算优先
+（`_cancel_beats_budget`，运行期 tick、终态归并、重启恢复三处共用同一判定）。
 
 | 时序 | 结果 | 依据 |
 | --- | --- | --- |
-| 先取消，之后预算才到点 | **CANCELLED** | tick 内取消判定先于预算判定；取消扫描先把作业落终态，到点时作业已终态不再扫描 |
-| 取消先持久化，进程在传播完成前崩溃，停机期间预算也走过 | **CANCELLED** | 恢复扫描同样“取消先于预算”，重启后兑现已落盘的取消意图 |
-| 预算先到点，之后再调取消 | **TIMED_OUT**，取消请求 **409 `job_already_terminal`** | 预算扫描已落终态；终态拒绝取消，`cancel_requested` 不会被置位 |
+| 先取消，之后预算才到点 | **CANCELLED** | `cancel_requested_at < budget_deadline`；取消扫描先把作业落终态，到点时作业已终态不再扫描 |
+| 取消先持久化（到点之前），进程在传播完成前崩溃，停机期间预算也走过 | **CANCELLED** | 恢复扫描用同一时间戳比较，取消发生在先，重启后兑现已落盘的取消意图 |
+| 预算先到点、之后再调取消（含“到点但收尾尚未落盘”的窗口） | **TIMED_OUT**，取消请求 **409 `job_already_terminal`** | `cancel()` 在 `now >= budget_deadline` 时按冲突拒绝，`cancel_requested` 不置位；作业等价终态，收尾稳定落 TIMED_OUT |
+| 取消在到点之后才发生且标记已落盘，进程在收尾前停止，重启恢复 | **TIMED_OUT** | 恢复时 `cancel_requested_at >= budget_deadline`，预算优先；已落盘的取消标记不改写终态 |
 | 所有步骤恰好在信号到达前全部 SUCCEEDED | **SUCCEEDED** | 终态归并中“全成功”优先级最高，取消/超时都“到达太晚”（运行期与重启恢复路径一致） |
 | 对任意终态（SUCCEEDED/FAILED/CANCELLED/TIMED_OUT）再调取消 | **409**，原状态不变 | 终态不可变 |
 
@@ -110,8 +118,13 @@
 
 ## 3. 取消的执行模型
 
-- 取消是**先持久化意图**（`jobs.cancel_requested=1`）再由调度循环传播，
-  因此即使取消信号与进程崩溃竞态，重启后取消仍会继续生效。
+- 取消是**先持久化意图**（`jobs.cancel_requested=1`，连同接受时刻
+  `jobs.cancel_requested_at`）再由调度循环传播，因此即使取消信号与进程
+  崩溃竞态，重启后取消仍会继续生效。
+- `cancel()` 入口的拒绝顺序：作业不存在 → 404；已终态 → 409
+  `job_already_terminal`；**预算截止点已过（即使收尾尚未落盘）→ 同样 409
+  `job_already_terminal`**，取消标记不置位——此时作业等价于终态
+  TIMED_OUT，取消不得插队和改写。
 - 运行中的执行 task 通过 `task.cancel()` 收到 `asyncio.CancelledError`：
   - `sleep` action 在每个 20ms 分片检查中断，立即抛出；
   - 执行器在入口检查取消（`CancellationError`）。
@@ -140,6 +153,10 @@
    TIMED_OUT（trace 依据 `budget already exhausted before process
    restarted`），作业落 TIMED_OUT；已成功结果原样保留。预算仍有效时才按
    常规路径恢复，剩余预算继续扣。
+6. **取消与预算的跨重启先后稳定**：恢复扫描用持久化的
+   `cancel_requested_at` 与 `budget_deadline` 比较（与运行期同一判定）。
+   取消发生在到点之前 → 兑现 CANCELLED；取消标记在到点之后才落盘
+   （例如收尾前进程被停掉）→ 预算优先，落 TIMED_OUT，取消标记不改写终态。
 
 恢复**不**保证：进程在步骤产生外部副作用之后、成功落盘之前崩溃时，
 该副作用不会发生（at-least-once 调度）。本服务内置 action 均无外部副作用，
@@ -153,4 +170,4 @@
 | `test_orchestration_retry.py`（6） | 并发上限的时间窗验证；下游等待上游成功；上游失败→下游 BLOCKED 与链式阻断；重试中 RETRYING 与耗尽 FAILED；`max_attempts=1`；非法依赖/环拒绝 |
 | `test_cancel.py`（5） | 运行中取消传播到运行与未启动步骤；已成功结果保留；终态取消 409；未知作业 404；HTTP 终态取消冲突 |
 | `test_recovery.py`（4） | 部分成功+在途运行时 kill 后续跑且成功步骤不重跑；终态作业重启不变；RETRYING 中重启后沿用 attempt 预算；优雅关闭后状态可恢复 |
-| `test_time_budget.py`（14） | 运行中掐断且成功结果保留/下游显式受阻；退避期耗尽 attempt 定格；排队步骤不放行；停机跨预算恢复即终态；短重启后续扣且正常成功；预算内完成；不带预算完全兼容；先取消后到点为 CANCELLED（运行期与跨重启均覆盖）；先到点后取消为 TIMED_OUT+409；到点瞬间全成功仍 SUCCEEDED；预算场景与失败/阻断归因区分；HTTP 预算字段透传与非法值 422；预算参与幂等冲突 |
+| `test_time_budget.py`（17） | 运行中掐断且成功结果保留/下游显式受阻；退避期耗尽 attempt 定格；排队步骤不放行；停机跨预算恢复即终态；短重启后续扣且正常成功；预算内完成；不带预算完全兼容；先取消后到点为 CANCELLED（运行期与跨重启均覆盖）；到点后取消在“收尾未走”窗口内被 409 拒绝且终态 TIMED_OUT（引擎与 HTTP 各一）；到点后落盘的取消标记跨重启仍落 TIMED_OUT；已 TIMED_OUT 再取消 409；到点瞬间全成功仍 SUCCEEDED；预算场景与失败/阻断归因区分；HTTP 预算字段透传与非法值 422；预算参与幂等冲突 |

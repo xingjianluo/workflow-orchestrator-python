@@ -151,6 +151,10 @@ class JobState:
     status: JobStatus = JobStatus.PENDING
     max_concurrency: int = 2
     cancel_requested: bool = False
+    # 取消请求被接受的墙钟时间戳。与 budget_deadline 比较可跨重启稳定判定
+    # “取消与预算到点谁先发生”：cancel_requested_at < budget_deadline 时取消
+    # 优先，否则预算优先。None 表示尚未取消（或老库未记录该列的数据）。
+    cancel_requested_at: float | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     error: str | None = None

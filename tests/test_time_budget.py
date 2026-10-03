@@ -22,6 +22,7 @@ from app.engine import WorkflowEngine, WorkflowError
 from app.executor import StepExecutor
 from app.models import (
     FAIL_REASON_BUDGET_EXHAUSTED,
+    JOB_TERMINAL,
     JobStatus,
     RejectReason,
     StepSpec,
@@ -418,3 +419,136 @@ async def test_all_succeeded_exactly_at_deadline_still_succeeds(engine):
     assert final == JobStatus.SUCCEEDED.value
     assert states["a"].status is StepStatus.SUCCEEDED
     assert states["b"].status is StepStatus.SUCCEEDED
+
+
+async def test_cancel_after_deadline_before_sweep_is_rejected(engine):
+    print("\n[input] b(sleep 2s), time_budget=0.2s; block the event loop past the "
+          "deadline so the budget sweep cannot run, then cancel inside the window")
+    specs = [StepSpec(key="b", action="sleep", params={"seconds": 2.0},
+                      max_attempts=1)]
+    job = await engine.submit(specs, None, max_concurrency=1,
+                              time_budget_seconds=0.2)
+    await asyncio.sleep(0.05)  # 让步骤进入 RUNNING、调度器进入等待
+    mid = engine.get_steps_state(job.id)[0]
+    print(f"[state] before deadline: step={mid.status.value}")
+    assert mid.status is StepStatus.RUNNING
+    # 同步阻塞事件循环跨过截止点：预算已到点，但收尾扫描没机会执行，
+    # 精确复现“到点了、只是还没走完收尾”的窗口。
+    time.sleep(0.3)
+    j = engine.get_job_state(job.id)
+    print(f"[state] deadline passed, sweep not run yet: job={j.status.value} "
+          f"deadline={j.budget_deadline:.3f} now={time.time():.3f}")
+    assert j.status not in JOB_TERMINAL  # 收尾尚未发生
+    assert time.time() >= j.budget_deadline  # 截止点确已过
+    # 窗口内到达的取消请求：必须按冲突拒绝（engine.cancel 在拒绝路径上
+    # 不 await，此处同步执行完毕，调度器不会抢先收尾）
+    try:
+        await engine.cancel(job.id)
+    except WorkflowError as exc:
+        print(f"[judge] cancel rejected: reason={exc.reason.value} "
+              f"msg={exc.message}")
+        assert exc.reason is RejectReason.JOB_ALREADY_TERMINAL
+    else:
+        raise AssertionError("expected job_already_terminal")
+    # 取消标记不得落盘
+    j2 = engine.get_job_state(job.id)
+    print(f"[state] after rejected cancel: cancel_requested="
+          f"{j2.cancel_requested} cancel_requested_at={j2.cancel_requested_at}")
+    assert j2.cancel_requested is False
+    assert j2.cancel_requested_at is None
+    # 放行事件循环：预算收尾把作业稳定落到 TIMED_OUT，不被取消搅乱
+    final = await wait_for_status(engine, job.id, timeout=3)
+    s = engine.get_steps_state(job.id)[0]
+    j3 = engine.get_job_state(job.id)
+    print(f"[judge] final={final} step={s.status.value} "
+          f"reason={s.fail_reason} cancel_requested={j3.cancel_requested}")
+    assert final == JobStatus.TIMED_OUT.value
+    assert s.status is StepStatus.TIMED_OUT
+    assert s.fail_reason == FAIL_REASON_BUDGET_EXHAUSTED
+    assert j3.cancel_requested is False
+
+
+async def test_cancel_after_deadline_persisted_then_reboot_recovers_timed_out(
+    db_path,
+):
+    print("\n[input] done(succeed)+long(sleep 5s), time_budget=0.3s; a cancel "
+          "that arrived AFTER the deadline got its flag persisted, process "
+          "stops before the sweep, downtime crosses the deadline "
+          "=> restart must land TIMED_OUT")
+    eng1 = await _new_engine(db_path)
+    specs = [
+        StepSpec(key="done", action="succeed", max_attempts=1),
+        StepSpec(key="long", action="sleep", params={"seconds": 5.0},
+                 max_attempts=1),
+    ]
+    job = await eng1.submit(specs, None, max_concurrency=2,
+                            time_budget_seconds=0.3)
+    await asyncio.sleep(0.05)
+    mid = {s.key: s for s in eng1.get_steps_state(job.id)}
+    print(f"[state before kill] done={mid['done'].status.value} "
+          f"long={mid['long'].status.value}")
+    assert mid["done"].status is StepStatus.SUCCEEDED
+    assert mid["long"].status is StepStatus.RUNNING
+    # 复现“取消在预算到点之后才发生、标记已落盘但收尾未走进程就停了”的
+    # 数据形态（修复前版本会在到点后仍接受取消并落盘；此处直接写入等价
+    # 数据）：cancel_requested_at 晚于 budget_deadline。
+    store = JobStore(db_path)
+    j = store.get_job(job.id)
+    j.cancel_requested = True
+    j.cancel_requested_at = j.budget_deadline + 0.05
+    store.update_job(j)
+    store.close()
+    print("[state on disk] cancel_requested=True, "
+          "cancel_requested_at = deadline + 0.05s; killing before sweep")
+    await eng1.aclose()
+    await asyncio.sleep(0.4)  # 停机期间墙钟跨过截止点
+
+    eng2 = await _new_engine(db_path)
+    try:
+        j2 = eng2.get_job_state(job.id)
+        states = {s.key: s for s in eng2.get_steps_state(job.id)}
+        print(f"[state after restart] job={j2.status.value} "
+              f"cancel_requested={j2.cancel_requested} "
+              f"done={states['done'].status.value} "
+              f"long={states['long'].status.value} "
+              f"long.reason={states['long'].fail_reason}")
+        # 取消真实发生在到点之后：预算优先，稳定落 TIMED_OUT；
+        # 已落盘的取消标记不得把终态改写成 CANCELLED
+        assert j2.status is JobStatus.TIMED_OUT
+        assert states["done"].status is StepStatus.SUCCEEDED
+        assert states["done"].result == {"ok": True}
+        assert states["long"].status is StepStatus.TIMED_OUT
+        assert states["long"].fail_reason == FAIL_REASON_BUDGET_EXHAUSTED
+    finally:
+        await eng2.aclose()
+
+
+async def test_http_cancel_after_deadline_before_sweep_returns_409(
+    client, engine
+):
+    print("\n[input] HTTP submit budget=0.2s sleep 2s; block loop past the "
+          "deadline; HTTP cancel inside the not-yet-finalized window")
+    body = {
+        "max_concurrency": 1,
+        "time_budget_seconds": 0.2,
+        "steps": [{"key": "b", "action": "sleep", "params": {"seconds": 2.0},
+                   "max_attempts": 1}],
+    }
+    r = await client.post("/jobs", json=body)
+    assert r.status_code == 201
+    job_id = r.json()["job_id"]
+    await asyncio.sleep(0.05)
+    time.sleep(0.3)  # 截止点已过，收尾尚未（或刚好）执行
+    r2 = await client.post(f"/jobs/{job_id}/cancel")
+    print(f"[judge] cancel after deadline -> HTTP {r2.status_code} "
+          f"body={r2.json()}")
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["reason"] == "job_already_terminal"
+    final = await wait_for_status(engine, job_id, timeout=3)
+    j = engine.get_job_state(job_id)
+    s = engine.get_steps_state(job_id)[0]
+    print(f"[judge] final={final} step={s.status.value} "
+          f"reason={s.fail_reason} cancel_requested={j.cancel_requested}")
+    assert final == JobStatus.TIMED_OUT.value
+    assert j.cancel_requested is False
+    assert s.fail_reason == FAIL_REASON_BUDGET_EXHAUSTED

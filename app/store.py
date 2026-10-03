@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status              TEXT NOT NULL,
     max_concurrency     INTEGER NOT NULL,
     cancel_requested    INTEGER NOT NULL DEFAULT 0,
+    cancel_requested_at REAL,
     created_at          REAL NOT NULL,
     updated_at          REAL NOT NULL,
     error               TEXT,
@@ -52,6 +53,7 @@ _MIGRATIONS = {
     "jobs": {
         "time_budget_seconds": "REAL",
         "budget_deadline": "REAL",
+        "cancel_requested_at": "REAL",
     },
 }
 
@@ -143,15 +145,17 @@ class JobStore:
             try:
                 self._conn.execute(
                     """INSERT INTO jobs(id, idempotency_key, status, max_concurrency,
-                       cancel_requested, created_at, updated_at, error, request_payload,
+                       cancel_requested, cancel_requested_at, created_at, updated_at,
+                       error, request_payload,
                        time_budget_seconds, budget_deadline)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         job.id,
                         job.idempotency_key,
                         job.status.value,
                         int(job.max_concurrency),
                         1 if job.cancel_requested else 0,
+                        job.cancel_requested_at,
                         job.created_at,
                         job.updated_at,
                         job.error,
@@ -192,6 +196,7 @@ class JobStore:
             status=JobStatus(row["status"]),
             max_concurrency=row["max_concurrency"],
             cancel_requested=bool(row["cancel_requested"]),
+            cancel_requested_at=row["cancel_requested_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             error=row["error"],
@@ -219,12 +224,13 @@ class JobStore:
         with self._lock:
             self._conn.execute(
                 """UPDATE jobs SET status=?, max_concurrency=?, cancel_requested=?,
-                   updated_at=?, error=?, request_payload=?,
+                   cancel_requested_at=?, updated_at=?, error=?, request_payload=?,
                    time_budget_seconds=?, budget_deadline=? WHERE id=?""",
                 (
                     job.status.value,
                     int(job.max_concurrency),
                     1 if job.cancel_requested else 0,
+                    job.cancel_requested_at,
                     job.updated_at,
                     job.error,
                     _dumps(job.request_payload),

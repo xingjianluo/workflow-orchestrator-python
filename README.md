@@ -47,7 +47,7 @@ curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' -d '{
 | reason | HTTP | 含义 |
 | --- | --- | --- |
 | `idempotency_conflict` | 409 | 幂等键被复用，但规范化请求体与首次不一致 |
-| `job_already_terminal` | 409 | 作业已在终态，不可取消 |
+| `job_already_terminal` | 409 | 作业已在终态不可取消；或预算截止点已过（收尾未必已落盘），作业等价终态 |
 | `job_not_found` | 404 | 作业不存在 |
 | `invalid_dependency` | 400 | 依赖了不存在的步骤、自依赖或依赖成环 |
 
@@ -140,12 +140,16 @@ PENDING ──依赖满足──> READY ──获得并发槽──> RUNNING ─
 
 ## 5. 取消语义
 
-- `POST /jobs/{id}/cancel` 先持久化 `cancel_requested=true` 并唤醒调度器。
+- `POST /jobs/{id}/cancel` 先持久化 `cancel_requested=true`（连同接受时刻
+  `cancel_requested_at`）并唤醒调度器。
 - 调度器执行取消传播扫描：**所有尚未终态的步骤**→ `CANCELLED`
   （`fail_reason=cancelled`），正在执行的任务收到 `CancelledError` 尽快停止
   （`sleep` 类步骤会立刻中断而非等到超时）。
 - 已 `SUCCEEDED` 的步骤结果原样保留、不被篡改；作业 → `CANCELLED`。
 - 对已终态作业（含 `TIMED_OUT`）取消返回 409 `job_already_terminal`。
+- **预算截止点已过的作业等价于终态**：即使收尾尚未落盘（调度被打断、
+  进程在收尾前停止等），取消请求同样返回 409 `job_already_terminal`，
+  取消标记不会落盘，作业终态稳定为 `TIMED_OUT`。
 
 ## 6. 作业整体时间预算（墙钟超时）
 
@@ -175,11 +179,17 @@ PENDING ──依赖满足──> READY ──获得并发槽──> RUNNING ─
 
 **与取消撞车的固定边界**（终态写定后不可变更）：
 
+谁先谁后按**真实发生的墙钟先后**判定，与处理顺序、是否重启无关：取消被
+接受时持久化接受时刻 `cancel_requested_at`，规则为
+`cancel_requested_at < budget_deadline` 时取消优先，否则预算优先；
+运行期调度、终态归并与重启恢复三处共用同一判定。
+
 | 时序 | 稳定结果 |
 | --- | --- |
 | 先取消、预算后到点 | `CANCELLED`（取消先落终态） |
-| 取消已落盘、传播未完成即崩溃且停机跨过预算 | `CANCELLED`（恢复时取消仍先于预算兑现） |
-| 预算先到点、之后再取消 | `TIMED_OUT`；取消返回 409 `job_already_terminal` |
+| 取消已落盘（到点之前）、传播未完成即崩溃且停机跨过预算 | `CANCELLED`（恢复时按时间戳判定取消在先，仍兑现） |
+| 预算先到点、之后再取消（含“到点但收尾尚未落盘”的窗口） | `TIMED_OUT`；取消返回 409 `job_already_terminal`，标记不落盘 |
+| 取消在到点之后才发生且标记已落盘，进程在收尾前停止 | 重启后仍 `TIMED_OUT`（恢复时按时间戳判定预算在先，标记不改写终态） |
 | 信号到达前所有步骤恰好全成功 | `SUCCEEDED`（信号“到达太晚”） |
 | 对任意已结束作业再调取消 | 409，原终态保持不变 |
 
@@ -188,6 +198,9 @@ PENDING ──依赖满足──> READY ──获得并发槽──> RUNNING ─
 - 所有状态变更在决策点同步写入 SQLite（WAL 模式，`synchronous=FULL`，写事务加锁），
   步骤的 spec 以 JSON 随步骤行持久化。
 - 服务启动（`engine.start()`）时扫描全部非终态作业：
+  - **取消与预算的先后按持久化时间戳判定**：`cancel_requested_at <
+    budget_deadline` 时兑现取消（CANCELLED）；取消标记在到点之后才落盘
+    的，预算优先，落 TIMED_OUT，取消标记不改写终态；
   - **带预算且 `now >= budget_deadline`**（预算在停机期间已走完）：不重建
     调度器，未终态步骤直接全部 `TIMED_OUT(budget_exhausted)`，作业直接落
     `TIMED_OUT`（trace 依据 `budget already exhausted before process
@@ -221,12 +234,12 @@ trace event=step_recovered  ... basis=process restart; no success result, resche
 ## 9. 本地验证
 
 ```bash
-uv run pytest -q                 # 全部 35 个用例
+uv run pytest -q                 # 全部 38 个用例
 uv run pytest tests/test_idempotency_concurrency.py   # 并发提交 / 幂等冲突（6）
 uv run pytest tests/test_orchestration_retry.py       # 依赖 / 并发 / 阻断 / 重试耗尽（6）
 uv run pytest tests/test_cancel.py                    # 取消传播（5）
 uv run pytest tests/test_recovery.py                  # 进程重启恢复（4）
-uv run pytest tests/test_time_budget.py               # 整体时间预算（14）
+uv run pytest tests/test_time_budget.py               # 整体时间预算（17）
 ```
 
 > 提示：也可用 `uv run python -m pytest` 调用；两种方式在干净环境
