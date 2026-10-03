@@ -55,6 +55,7 @@ class JobOut(BaseModel):
     idempotency_key: str | None = None
     status: JobStatus
     cancel_requested: bool
+    cancel_requested_at: float | None = None
     max_concurrency: int
     error: str | None = None
     time_budget_seconds: float | None = None
@@ -68,6 +69,7 @@ class JobOut(BaseModel):
             idempotency_key=job.idempotency_key,
             status=job.status,
             cancel_requested=job.cancel_requested,
+            cancel_requested_at=job.cancel_requested_at,
             max_concurrency=job.max_concurrency,
             error=job.error,
             time_budget_seconds=job.time_budget_seconds,

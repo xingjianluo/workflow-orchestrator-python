@@ -22,6 +22,7 @@ def build_router(get_engine) -> APIRouter:
         status = {
             "idempotency_conflict": 409,
             "job_already_terminal": 409,
+            "job_budget_deadline_reached": 409,
             "job_not_found": 404,
             "invalid_dependency": 400,
         }[exc.reason.value]

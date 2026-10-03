@@ -17,8 +17,11 @@
    接受起按 time.time() 扣减，截止点 budget_deadline 以绝对时间戳持久化。
    截止点到（含重启时发现其已在过去）时，所有未终态步骤 -> TIMED_OUT
    (fail_reason=budget_exhausted)，已成功结果保留，作业 -> TIMED_OUT；
-   退避/排队中的步骤不再被放行。取消判定先于预算判定（先取消后到点稳定
-   为 CANCELLED）；终态不可变更。
+   退避/排队中的步骤不再被放行。取消与预算谁先谁后只按真实墙钟时刻判定
+   （cancel_requested_at < budget_deadline 才算取消在先），与处理顺序、
+   是否重启无关：取消在先稳定 CANCELLED；到点之后才到达的取消不被接受
+   （运行期 409 job_budget_deadline_reached，恢复时清除迟到标记），
+   终态稳定 TIMED_OUT；终态不可变更。
 6. 重启恢复：start() 时扫描存储，预算已耗尽的非终态作业直接落 TIMED_OUT，
    其余非终态作业重新装载并调度；SUCCEEDED 步骤原样保留绝不重跑，
    RUNNING/RETRYING/PENDING/READY 继续调度。
@@ -34,21 +37,22 @@ import contextvars
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from app.executor import StepExecutionError, StepExecutor
 from app.models import (
-    CancellationError,
     FAIL_REASON_BUDGET_EXHAUSTED,
     FAIL_REASON_CANCELLED,
     FAIL_REASON_RETRY_EXHAUSTED,
     FAIL_REASON_UPSTREAM_FAILED,
-    JobState,
-    JobStatus,
     JOB_TERMINAL,
-    RejectReason,
     STEP_FAILING,
     STEP_TERMINAL,
+    CancellationError,
+    JobState,
+    JobStatus,
+    RejectReason,
     StepSpec,
     StepState,
     StepStatus,
@@ -104,6 +108,29 @@ def canonical_request(
     }
 
 
+def cancel_outranks_budget(job: JobState) -> bool:
+    """取消请求是否“真实先于”预算到点发生。
+
+    判定只依据两个已持久化的墙钟时刻：取消被接受的时刻
+    ``cancel_requested_at`` 与预算截止点 ``budget_deadline``。
+    因此结论与调度器先处理哪个信号、中间是否重启过都无关：
+
+    - 取消时刻严格早于截止点 -> 取消赢（终态 CANCELLED）；
+    - 取消时刻等于/晚于截止点 -> 预算赢（终态 TIMED_OUT），
+      到点那一刻才到达的取消视为“到得太晚”；
+    - 未带预算：取消恒赢（与历史无预算作业行为一致）；
+    - 旧库兼容：cancel_requested=True 但 cancel_requested_at 缺失
+      （历史版本已落盘的取消意图）时保守承认取消在先。
+    """
+    if not job.cancel_requested:
+        return False
+    if job.budget_deadline is None:
+        return True
+    if job.cancel_requested_at is None:
+        return True
+    return job.cancel_requested_at < job.budget_deadline
+
+
 def validate_specs(specs: list[StepSpec]) -> None:
     keys: set[str] = set()
     for s in specs:
@@ -155,11 +182,15 @@ class _JobRunner:
         executor: StepExecutor,
         job_id: str,
         cond: asyncio.Condition,
+        tick_gate: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._store = store
         self._executor = executor
         self._job_id = job_id
         self._cond = cond
+        # 每个调度 tick 开头等待的可选挂点（测试用：模拟“到点那一刻调度被
+        # 打断”，让取消恰好夹在截止点与收尾扫描之间到达）。生产恒为 None。
+        self._tick_gate = tick_gate
         self._sem: asyncio.Semaphore | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stop = False
@@ -204,6 +235,8 @@ class _JobRunner:
         _trace("job_scheduler_start", job_id=self._job_id, reason="new or recovered")
         try:
             while not self._stop:
+                if self._tick_gate is not None:
+                    await self._tick_gate(self._job_id)
                 done = await self._tick()
                 if done:
                     return
@@ -233,22 +266,30 @@ class _JobRunner:
 
         # 1) 取消传播：仍有未终态步骤时才扫描取消；
         #    若全部步骤恰好已终态（取消到达太晚），交给终态归并判定。
-        if job.cancel_requested and any(
-            s.status not in STEP_TERMINAL for s in steps.values()
+        #    取消与预算到点谁先谁后，按各自真实发生的墙钟时刻判定，
+        #    而不是按“本 tick 先看到谁”：取消时刻晚于/等于截止点的，
+        #    取消请求本就不会被接受（见 WorkflowEngine.cancel）；若该取消
+        #    标记是崩溃前落盘、重启后才被发现的，则在恢复路径处理。
+        #    因此这里能成立的 cancel_requested 必然先于到点，取消优先。
+        if (
+            cancel_outranks_budget(job)
+            and any(s.status not in STEP_TERMINAL for s in steps.values())
         ):
             await self._propagate_cancel(job, steps)
             return True
 
         # 2) 整体时间预算：预算到点且仍有未终态步骤时立即收尾。
-        #    排在取消之后，因此同一 tick 两者同时挂起时取消优先
-        #    （“先取消后预算到点”稳定为 CANCELLED）。
-        #    若全部步骤恰好已终态（预算到点“到达太晚”），不做收尾扫描，
-        #    交给终态归并判定（全 SUCCEEDED -> SUCCEEDED）。
+        #    晚于截止点到达的取消不改变结论：此时若 cancel_requested
+        #    已被置位（理论上只可能来自旧版本写入），按预算收尾，
+        #    并清掉这条“到得太晚”的取消标记，终态稳定为 TIMED_OUT。
         if (
             job.budget_deadline is not None
             and time.time() >= job.budget_deadline
             and any(s.status not in STEP_TERMINAL for s in steps.values())
         ):
+            if job.cancel_requested:
+                job.cancel_requested = False
+                job.cancel_requested_at = None
             await self._propagate_budget_timeout(job, steps)
             return True
 
@@ -323,20 +364,22 @@ class _JobRunner:
         job = self._job()
         # 归并顺序需消除“收尾信号与自然完成同时发生”的竞态歧义：
         # 1) 若所有步骤都已 SUCCEEDED，则作业视为成功（取消/预算到点到达得太晚）；
-        # 2) 否则人工取消优先（cancel_requested 或存在 CANCELLED 步骤）；
+        # 2) 否则人工取消优先——但仅当取消真实先于预算到点（或作业不带预算）；
+        #    到点之后才到达的取消不能把 TIMED_OUT 步骤改写为 CANCELLED；
         # 3) 否则预算耗尽（TIMED_OUT 步骤只可能来自预算收尾扫描）；
         # 4) 其余按失败归并。
         if all(s.status == StepStatus.SUCCEEDED for s in steps.values()):
             job.status = JobStatus.SUCCEEDED
             self._save_job(job, "job_succeeded", basis="all steps succeeded")
-        elif job.cancel_requested or any(
-            s.status is StepStatus.CANCELLED for s in steps.values()
+        elif cancel_outranks_budget(job) and (
+            job.cancel_requested
+            or any(s.status is StepStatus.CANCELLED for s in steps.values())
         ):
             job.status = JobStatus.CANCELLED
             self._save_job(
                 job,
                 "job_cancelled",
-                basis="cancel requested propagated to unfinished steps",
+                basis="cancel requested before budget deadline propagated to unfinished steps",
             )
         elif any(s.status is StepStatus.TIMED_OUT for s in steps.values()):
             job.status = JobStatus.TIMED_OUT
@@ -460,7 +503,7 @@ class _JobRunner:
         if step.status in STEP_TERMINAL:
             return
         job = self._job()
-        if job.cancel_requested:
+        if cancel_outranks_budget(job):
             return
         # 并发槽可能恰好等到预算耗尽才拿到：此时不得再发起一次尝试
         if job.budget_deadline is not None and time.time() >= job.budget_deadline:
@@ -564,9 +607,13 @@ class WorkflowEngine:
         self,
         store: JobStore,
         executor: StepExecutor | None = None,
+        tick_gate: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._store = store
         self._executor = executor or StepExecutor()
+        # 测试挂点：在每个作业 runner 的每个调度 tick 开头 await(job_id)。
+        # 用于确定性制造“预算到点那一刻调度被打断、取消随后才到”的窗口。
+        self._tick_gate = tick_gate
         self._runners: dict[
             str, tuple[_JobRunner, asyncio.Task[None], asyncio.Condition]
         ] = {}
@@ -590,18 +637,38 @@ class WorkflowEngine:
                 continue
             steps = self._store.list_steps(job.id)
             unfinished = [s for s in steps if s.status not in STEP_TERMINAL]
-            # 停机恢复第一判定：取消意图先于预算（与运行期 tick 顺序一致）。
-            # 取消信号在崩溃前已持久化、但尚未完成传播扫描时，重启后仍要
-            # 兑现 CANCELLED，即使停机期间预算也已经到点。
-            if job.cancel_requested and unfinished:
+            # 停机恢复的撞车判定与运行期完全一致：只按两个已持久化的墙钟
+            # 时刻判“谁先谁后”，不因重启、不因谁先被扫描而改变结论。
+            deadline_reached = (
+                job.budget_deadline is not None and now >= job.budget_deadline
+            )
+            # 第一判定：取消真实先于预算到点（崩溃前已持久化、传播扫描未
+            # 走完）——即使停机期间预算也已经走过，重启后仍兑现 CANCELLED。
+            if (
+                job.cancel_requested
+                and unfinished
+                and (not deadline_reached or cancel_outranks_budget(job))
+            ):
                 self._finalize_cancel_on_recovery(job, steps, now)
                 cancelled_on_recovery += 1
                 continue
-            # 停机恢复第二判定：预算按墙钟照扣。若重启时预算早已走完
-            # （含停机这段时间跨过截止点），作业直接落 TIMED_OUT 终态，
-            # 绝不重新调度任何步骤。
-            if job.budget_deadline is not None and now >= job.budget_deadline:
+            # 第二判定：预算按墙钟照扣。若取消标记是在到点之后才落盘的
+            # （崩溃窗口夹在截止点与收尾之间），该取消不被接受：清掉标记，
+            # 作业稳定落 TIMED_OUT。
+            if deadline_reached:
                 if unfinished:
+                    if job.cancel_requested:
+                        _trace(
+                            "cancel_rejected",
+                            job_id=job.id,
+                            reason=RejectReason.JOB_BUDGET_DEADLINE_REACHED.value,
+                            basis=(
+                                "cancel persisted at/after deadline before crash; "
+                                "timeout wins on recovery"
+                            ),
+                            cancel_requested_at=job.cancel_requested_at,
+                            deadline=job.budget_deadline,
+                        )
                     self._finalize_budget_timeout_on_recovery(job, now)
                     timed_out_on_recovery += 1
                     continue
@@ -610,6 +677,8 @@ class WorkflowEngine:
                 self._spawn(job.id)
                 recovered += 1
                 continue
+            # 预算仍有效：若取消标记在截止点之前落盘但步骤恰已全终态，
+            # 交给重建后的调度器按终态归并处理。
             # 崩溃恢复：进程中断时 RUNNING 的尝试不算成功结果，
             # 重置为 READY 继续调度（attempt 保留，退避到点立即跑）。
             for step in steps:
@@ -668,6 +737,11 @@ class WorkflowEngine:
         """恢复路径的预算收尾：不重建调度器，直接把未终态步骤与作业落终态。"""
         steps = self._store.list_steps(job.id)
         elapsed = now - job.created_at
+        # 取消标记若晚于截止点落盘则不被接受：清掉，保持终态证据自洽。
+        late_cancel = job.cancel_requested and not cancel_outranks_budget(job)
+        if late_cancel:
+            job.cancel_requested = False
+            job.cancel_requested_at = None
         for step in steps:
             if step.status in STEP_TERMINAL:
                 continue
@@ -714,6 +788,13 @@ class WorkflowEngine:
             async with cond:
                 cond.notify_all()
         if tasks:
+            # 正常情况下 runner 在当前 tick 收尾后立刻自然退出；给一个短宽限。
+            # 若调度协程被阻塞在无法解除的等待上（例如测试门控、异常的运行
+            # 环境），宽限后强制撤销调度任务本身——这与“进程被杀”等价，
+            # 持久化状态由重启恢复路径收敛到确定终态。
+            _, pending = await asyncio.wait(tasks, timeout=0.5)
+            for t in pending:
+                t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         self._runners.clear()
         self._started = False
@@ -729,7 +810,9 @@ class WorkflowEngine:
 
     def _spawn(self, job_id: str) -> None:
         cond = asyncio.Condition()
-        runner = _JobRunner(self._store, self._executor, job_id, cond)
+        runner = _JobRunner(
+            self._store, self._executor, job_id, cond, tick_gate=self._tick_gate
+        )
         task = asyncio.create_task(runner.run(), name=f"job-{job_id}")
         self._runners[job_id] = (runner, task, cond)
         # 无需提前 notify：runner 的首轮 _tick 在其第一次挂起前已同步执行。
@@ -830,12 +913,35 @@ class WorkflowEngine:
                 RejectReason.JOB_ALREADY_TERMINAL,
                 f"job already terminal: {job.status.value}",
             )
+        # 非终态但预算已经到点：终态按规则应是 TIMED_OUT（收尾可能正在进行，
+        # 也可能恰好被调度打断/进程停在收尾前）。此时取消“到得太晚”，
+        # 不接受、不落 cancel_requested，返回可区分的 409 原因码。
+        if job.budget_deadline is not None and time.time() >= job.budget_deadline:
+            _trace(
+                "cancel_rejected",
+                job_id=job_id,
+                reason=RejectReason.JOB_BUDGET_DEADLINE_REACHED.value,
+                basis="cancel arrived at/after wall-clock budget deadline; timeout wins",
+                deadline=job.budget_deadline,
+                now=time.time(),
+            )
+            raise WorkflowError(
+                RejectReason.JOB_BUDGET_DEADLINE_REACHED,
+                "job time budget already exhausted at cancel time; "
+                "terminal state is timed_out",
+            )
+        accepted_at = time.time()
         job.cancel_requested = True
+        # 仅在尚未记录时锁定首次接受时刻：重复取消不应改写“真实先后”的证据。
+        if job.cancel_requested_at is None:
+            job.cancel_requested_at = accepted_at
         self._store.update_job(job)
         _trace(
             "cancel_requested",
             job_id=job_id,
-            basis="client cancel request accepted",
+            basis="client cancel request accepted before budget deadline",
+            cancel_requested_at=job.cancel_requested_at,
+            deadline=job.budget_deadline,
         )
         entry = self._runners.get(job_id)
         if entry is not None:

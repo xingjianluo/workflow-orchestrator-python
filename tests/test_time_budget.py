@@ -8,6 +8,9 @@
 - 预算未耗尽时正常完成；不带预算的作业行为与历史完全一致；
 - 超时与取消撞车：先取消后到点=CANCELLED，先到点后取消=TIMED_OUT 且取消 409，
   对已结束作业再取消=409，状态互不搅乱；
+- 预算到点与收尾扫描之间的窗口（运行期调度被打断 / 停机跨过截止点）内到达的
+  取消同样拒绝（job_budget_deadline_reached），终态稳定 TIMED_OUT，跨重启一致；
+- 取消与预算谁先谁后只按真实墙钟时刻判定（cancel_requested_at vs deadline）；
 - 步骤 fail_reason=budget_exhausted 与 cancelled / upstream_failed /
   retry_exhausted 明确可区分；
 - HTTP 提交透传 time_budget_seconds，查询可见预算与截止点。
@@ -22,6 +25,7 @@ from app.engine import WorkflowEngine, WorkflowError
 from app.executor import StepExecutor
 from app.models import (
     FAIL_REASON_BUDGET_EXHAUSTED,
+    JobState,
     JobStatus,
     RejectReason,
     StepSpec,
@@ -396,6 +400,301 @@ async def test_cancel_before_downtime_budget_deadline_wins_after_restart(db_path
         assert states["long"].fail_reason == "cancelled"
     finally:
         await eng2.aclose()
+
+
+async def test_cancel_after_budget_deadline_but_before_sweep_is_rejected(db_path):
+    """预算先到点、收尾扫描被打断的窗口内到达的取消：拒绝且终态仍为 TIMED_OUT。
+
+    用 tick_gate 把“截止点之后的第一个调度 tick”确定性挂住，模拟题目描述的
+    “那一刻调度被打断 / 进程正好在收尾前被停掉”：截止点已过但作业仍 RUNNING，
+    此时发取消必须按冲突拒绝（job_budget_deadline_reached），不放行取消、
+    不改写终态；放行收尾后作业稳定落 TIMED_OUT。
+    """
+    print("\n[input] sleep 5s, time_budget=0.1s; scheduler tick after deadline is "
+          "gated; cancel arrives inside the deadline<->sweep window")
+    gated = asyncio.Event()
+    release = asyncio.Event()
+
+    async def tick_gate(job_id: str) -> None:
+        if not gated.is_set():
+            gated.set()  # 首个 tick 立即放行（提交/起调度）
+            return
+        await release.wait()  # 之后的 tick 全部挂住，直到测试显式放行
+
+    eng = WorkflowEngine(JobStore(db_path), StepExecutor(), tick_gate=tick_gate)
+    await eng.start()
+    try:
+        specs = [
+            StepSpec(key="ok", action="succeed", max_attempts=1),
+            StepSpec(key="long", action="sleep", params={"seconds": 5.0},
+                     max_attempts=1),
+        ]
+        job = await eng.submit(specs, None, max_concurrency=2,
+                               time_budget_seconds=0.1)
+        await gated.wait()
+        await asyncio.sleep(0.25)  # 确定走过截止点；收尾 tick 仍被挂在门口
+        j = eng.get_job_state(job.id)
+        print(f"[state] deadline passed, sweep gated: job={j.status.value} "
+              f"deadline={j.budget_deadline:.4f}")
+        assert j.status is JobStatus.RUNNING
+        try:
+            await eng.cancel(job.id)
+        except WorkflowError as exc:
+            print(f"[judge] cancel in window rejected: reason={exc.reason.value} "
+                  f"msg={exc.message}")
+            assert exc.reason is RejectReason.JOB_BUDGET_DEADLINE_REACHED
+        else:
+            raise AssertionError("expected job_budget_deadline_reached rejection")
+        j = eng.get_job_state(job.id)
+        print(f"[state] rejection leaves job={j.status.value} "
+              f"cancel_requested={j.cancel_requested} "
+              f"cancel_requested_at={j.cancel_requested_at}")
+        assert j.status is JobStatus.RUNNING          # 取消没有推动任何状态
+        assert j.cancel_requested is False             # 迟到取消不落标记
+        release.set()                                  # 放行被挂住的收尾扫描
+        final = await wait_for_status(eng, job.id, timeout=3)
+        states = {s.key: s for s in eng.get_steps_state(job.id)}
+        print(f"[state after sweep] job={final} "
+              f"ok={states['ok'].status.value} long={states['long'].status.value} "
+              f"long.reason={states['long'].fail_reason}")
+        assert final == JobStatus.TIMED_OUT.value
+        assert states["ok"].status is StepStatus.SUCCEEDED
+        assert states["ok"].result == {"ok": True}
+        assert states["long"].status is StepStatus.TIMED_OUT
+        assert states["long"].fail_reason == FAIL_REASON_BUDGET_EXHAUSTED
+        assert eng.get_job_state(job.id).cancel_requested is False
+    finally:
+        release.set()
+        await eng.aclose()
+
+
+async def test_late_cancel_persisted_before_crash_times_out_after_restart(db_path):
+    """取消在截止点之后才落盘、收尾前停机：同一份数据重启后必须落 TIMED_OUT。
+
+    构造：截止点已过但收尾扫描尚未执行（模拟进程停在收尾前），取消标记带着
+    晚于 deadline 的 cancel_requested_at 落盘后“杀死”进程；停机跨过截止点，
+    用同一份数据重启 -> 拒绝兑现迟到取消，作业 TIMED_OUT，成功结果保留，
+    cancel_requested 被清回 False。
+    """
+    print("\n[input] ok(succeed)+long(sleep 5s), time_budget=0.1s; gate the sweep; "
+          "persist late cancel (timestamp after deadline), kill, restart")
+    gated = asyncio.Event()
+    release = asyncio.Event()
+
+    async def tick_gate(job_id: str) -> None:
+        if not gated.is_set():
+            gated.set()
+            return
+        await release.wait()
+
+    store = JobStore(db_path)
+    eng1 = WorkflowEngine(store, StepExecutor(), tick_gate=tick_gate)
+    await eng1.start()
+    specs = [
+        StepSpec(key="ok", action="succeed", max_attempts=1),
+        StepSpec(key="long", action="sleep", params={"seconds": 5.0},
+                 max_attempts=1),
+    ]
+    job = await eng1.submit(specs, None, max_concurrency=2,
+                            time_budget_seconds=0.1)
+    await gated.wait()
+    await asyncio.sleep(0.25)  # 截止点已过，收尾被挂住
+    on_disk = store.get_job(job.id)
+    on_disk.cancel_requested = True
+    on_disk.cancel_requested_at = time.time()  # 明确晚于 deadline
+    store.update_job(on_disk)
+    print(f"[state on disk at kill] status={on_disk.status.value} "
+          f"cancel_requested={on_disk.cancel_requested} "
+          f"cancel_at={on_disk.cancel_requested_at:.4f} "
+          f"deadline={on_disk.budget_deadline:.4f}")
+    # 注意：这里绝不能 release 挂住的收尾 tick——必须保证 TIMED_OUT 收尾
+    # 完全没有在旧进程内发生，TIMED_OUT 只能由重启恢复路径写定。
+    await eng1.aclose()  # “杀死”：撤销在途任务，不等待任何收尾
+    await asyncio.sleep(0.2)  # 停机跨过截止点
+
+    eng2 = WorkflowEngine(JobStore(db_path), StepExecutor())
+    await eng2.start()
+    try:
+        j2 = eng2.get_job_state(job.id)
+        states = {s.key: s for s in eng2.get_steps_state(job.id)}
+        print(f"[state after restart] job={j2.status.value} "
+              f"ok={states['ok'].status.value}(result={states['ok'].result}) "
+              f"long={states['long'].status.value} reason={states['long'].fail_reason} "
+              f"cancel_requested={j2.cancel_requested}")
+        assert j2.status is JobStatus.TIMED_OUT  # 迟到取消不能改写预算终态
+        assert states["ok"].status is StepStatus.SUCCEEDED
+        assert states["ok"].result == {"ok": True}
+        assert states["long"].status is StepStatus.TIMED_OUT
+        assert states["long"].fail_reason == FAIL_REASON_BUDGET_EXHAUSTED
+        assert j2.cancel_requested is False
+        # 再等一拍确认不会复活重跑
+        before = states["long"].attempt
+        await asyncio.sleep(0.2)
+        after = eng2.get_steps_state(job.id)[1].attempt
+        print(f"[judge] long.attempt stable across restart: {before} -> {after}")
+        assert before == after
+    finally:
+        await eng2.aclose()
+
+
+def test_cancel_vs_budget_precedence_decided_by_real_timestamps():
+    """先后判定的纯规则单测：只看真实墙钟时刻，与处理顺序、重启无关。"""
+    def mk(cancel_at, deadline=100.0, has_budget=True, requested=True):
+        return JobState(
+            id="j",
+            idempotency_key=None,
+            cancel_requested=requested,
+            cancel_requested_at=cancel_at,
+            budget_deadline=deadline if has_budget else None,
+        )
+
+    print("\n[input] precedence truth table over (cancel_requested_at vs deadline)")
+    cases = [
+        ("cancel strictly before deadline", mk(99.9), True),
+        ("cancel far before deadline", mk(1.0), True),
+        ("cancel exactly at deadline -> timeout wins", mk(100.0), False),
+        ("cancel after deadline -> timeout wins", mk(100.1), False),
+        ("no budget: cancel always wins", mk(None, has_budget=False), True),
+        ("no cancel requested", mk(None, requested=False), False),
+        ("legacy row: flag set, timestamp missing -> cancel honored",
+         mk(None), True),
+    ]
+    from app.engine import cancel_outranks_budget
+    for name, job, expected in cases:
+        got = cancel_outranks_budget(job)
+        print(f"[judge] {name}: cancel_outranks_budget={got} (expect {expected})")
+        assert got is expected
+    print("[state] precedence is a pure timestamp comparison: no scheduler or "
+          "restart involved")
+
+
+async def test_concurrent_cancel_race_around_deadline_is_stable(engine):
+    """收尾与取消几乎同时到达的并发压测：终态必须与“真实先后”证据永远自洽。
+
+    一组带短预算、长步骤的作业，取消时刻在截止点两侧随机抖动并与调度器
+    收尾真正并发；对每个作业只断言可复现的不变量：
+      - 终态只有 CANCELLED 或 TIMED_OUT；
+      - 若取消在截止点前被接受（cancel_requested_at<deadline），必为 CANCELLED；
+      - 否则必为 TIMED_OUT，且迟到取消不落标记、不把终态改写成 CANCELLED。
+    """
+    import random
+
+    n = 12
+    budget = 0.2
+    print(f"\n[input] {n} jobs, each sleep 5s, time_budget={budget}s; cancel at "
+          f"random offset around deadline, truly concurrent with the sweep")
+    submitted: list[tuple[str, float]] = []
+    for i in range(n):
+        specs = [StepSpec(key="s", action="sleep", params={"seconds": 5.0},
+                          max_attempts=1)]
+        job = await engine.submit(specs, None, max_concurrency=1,
+                                  time_budget_seconds=budget)
+        submitted.append((job.id, job.budget_deadline))
+
+    async def cancel_later(job_id: str, deadline: float, rng: random.Random) -> None:
+        # 截止点前后 ±0.12s 抖动，制造“几乎同时到达”
+        offset = rng.uniform(-0.12, 0.12)
+        await asyncio.sleep(max(0.0, budget + offset))
+        try:
+            await engine.cancel(job_id)
+        except WorkflowError:
+            pass  # 到点后/终态拒绝均属预期，最终只按不变量校验
+
+    rng = random.Random(20261003)
+    await asyncio.gather(
+        *(cancel_later(jid, dl, rng) for jid, dl in submitted),
+        *(wait_for_status(engine, jid, timeout=3) for jid, _ in submitted),
+    )
+
+    cancelled_jobs = timed_out_jobs = 0
+    for jid, deadline in submitted:
+        job = engine.get_job_state(jid)
+        step = engine.get_steps_state(jid)[0]
+        accepted_before = (
+            job.cancel_requested_at is not None
+            and job.cancel_requested_at < deadline
+        )
+        if job.status is JobStatus.CANCELLED:
+            cancelled_jobs += 1
+            cond = accepted_before and step.status is StepStatus.CANCELLED
+            print(f"[state] {jid}: CANCELLED cancel_at<deadline={accepted_before} "
+                  f"step={step.status.value}")
+            assert cond, (jid, job.status, step.status, job.cancel_requested_at)
+        elif job.status is JobStatus.TIMED_OUT:
+            timed_out_jobs += 1
+            print(f"[state] {jid}: TIMED_OUT cancel_at<deadline={accepted_before} "
+                  f"step={step.status.value} cancel_requested={job.cancel_requested}")
+            # 迟到取消绝不能把终态/步骤改成 cancelled，也不应残留标记
+            assert step.status is StepStatus.TIMED_OUT
+            assert step.fail_reason == FAIL_REASON_BUDGET_EXHAUSTED
+            assert not accepted_before
+        else:
+            raise AssertionError(f"{jid} unexpected {job.status}")
+    print(f"[judge] cancelled={cancelled_jobs} timed_out={timed_out_jobs} "
+          f"(total {n}); every terminal matches the real timestamp order")
+    assert cancelled_jobs + timed_out_jobs == n
+
+
+async def test_http_cancel_in_deadline_window_returns_409_budget_reason(db_path):
+    """HTTP 侧：截止点已过、收尾扫描被挂住时的取消 -> 409 job_budget_deadline_reached。"""
+    print("\n[input] HTTP-equivalent: sleep 5s, time_budget=0.1s; sweep gated past "
+          "deadline; cancel() inside the window")
+    gated = asyncio.Event()
+    release = asyncio.Event()
+
+    async def tick_gate(job_id: str) -> None:
+        if not gated.is_set():
+            gated.set()
+            return
+        await release.wait()
+
+    eng = WorkflowEngine(JobStore(db_path), StepExecutor(), tick_gate=tick_gate)
+    await eng.start()
+    try:
+        specs = [StepSpec(key="b", action="sleep", params={"seconds": 5.0},
+                          max_attempts=1)]
+        job = await eng.submit(specs, None, max_concurrency=1,
+                               time_budget_seconds=0.1)
+        await gated.wait()
+        await asyncio.sleep(0.25)
+        try:
+            await eng.cancel(job.id)
+        except WorkflowError as exc:
+            print(f"[judge] in-window cancel rejection reason={exc.reason.value}")
+            assert exc.reason is RejectReason.JOB_BUDGET_DEADLINE_REACHED
+        else:
+            raise AssertionError("expected job_budget_deadline_reached")
+        release.set()
+        final = await wait_for_status(eng, job.id, timeout=3)
+        assert final == JobStatus.TIMED_OUT.value
+    finally:
+        release.set()
+        await eng.aclose()
+
+
+async def test_http_cancel_after_timeout_returns_409_terminal(client, engine):
+    """HTTP 侧：已落 TIMED_OUT 终态后再取消 -> 409 job_already_terminal，终态不改。"""
+    print("\n[input] HTTP: sleep 5s, time_budget=0.1s; wait TIMED_OUT, POST cancel")
+    body = {
+        "max_concurrency": 1,
+        "time_budget_seconds": 0.1,
+        "steps": [{"key": "b", "action": "sleep", "params": {"seconds": 5.0},
+                   "max_attempts": 1}],
+    }
+    r = await client.post("/jobs", json=body)
+    job_id = r.json()["job_id"]
+    await _wait_job(engine, job_id, JobStatus.TIMED_OUT, timeout=3)
+    r2 = await client.post(f"/jobs/{job_id}/cancel")
+    print(f"[judge] cancel after terminal -> HTTP {r2.status_code} "
+          f"reason={r2.json()['detail']['reason']}")
+    assert r2.status_code == 409
+    assert r2.json()["detail"]["reason"] == "job_already_terminal"
+    r3 = await client.get(f"/jobs/{job_id}")
+    print(f"[state] GET status={r3.json()['status']} "
+          f"step={r3.json()['steps'][0]['status']} "
+          f"cancel_requested={r3.json()['cancel_requested']}")
+    assert r3.json()["status"] == JobStatus.TIMED_OUT.value
+    assert r3.json()["cancel_requested"] is False
 
 
 async def test_all_succeeded_exactly_at_deadline_still_succeeds(engine):

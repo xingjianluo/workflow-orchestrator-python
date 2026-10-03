@@ -83,6 +83,8 @@ class RejectReason(str, enum.Enum):
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"  # 幂等键相同但请求体不一致
     JOB_NOT_FOUND = "job_not_found"
     JOB_ALREADY_TERMINAL = "job_already_terminal"  # 终态作业不可取消
+    # 非终态但整体预算已到点（截止时刻已到）：取消请求按冲突拒绝，终态归预算
+    JOB_BUDGET_DEADLINE_REACHED = "job_budget_deadline_reached"
     INVALID_DEPENDENCY = "invalid_dependency"  # 依赖不存在或成环
 
 
@@ -151,6 +153,10 @@ class JobState:
     status: JobStatus = JobStatus.PENDING
     max_concurrency: int = 2
     cancel_requested: bool = False
+    # 取消请求真正被接受的墙钟时刻；None 表示从未接受过取消。
+    # 与 budget_deadline 比较以稳定判定“取消与预算到点谁先发生”，
+    # 该判定不依赖谁先被调度处理，跨重启结论不变。
+    cancel_requested_at: float | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     error: str | None = None

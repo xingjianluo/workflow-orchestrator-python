@@ -48,6 +48,7 @@ curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' -d '{
 | --- | --- | --- |
 | `idempotency_conflict` | 409 | 幂等键被复用，但规范化请求体与首次不一致 |
 | `job_already_terminal` | 409 | 作业已在终态，不可取消 |
+| `job_budget_deadline_reached` | 409 | 取消到达时整体预算已到点（作业尚未走完收尾）；取消不接受，终态为 `timed_out` |
 | `job_not_found` | 404 | 作业不存在 |
 | `invalid_dependency` | 400 | 依赖了不存在的步骤、自依赖或依赖成环 |
 
@@ -140,12 +141,18 @@ PENDING ──依赖满足──> READY ──获得并发槽──> RUNNING ─
 
 ## 5. 取消语义
 
-- `POST /jobs/{id}/cancel` 先持久化 `cancel_requested=true` 并唤醒调度器。
+- `POST /jobs/{id}/cancel` 先持久化 `cancel_requested=true` 与
+  `cancel_requested_at=<接受时刻>`，再唤醒调度器。
 - 调度器执行取消传播扫描：**所有尚未终态的步骤**→ `CANCELLED`
   （`fail_reason=cancelled`），正在执行的任务收到 `CancelledError` 尽快停止
   （`sleep` 类步骤会立刻中断而非等到超时）。
 - 已 `SUCCEEDED` 的步骤结果原样保留、不被篡改；作业 → `CANCELLED`。
-- 对已终态作业（含 `TIMED_OUT`）取消返回 409 `job_already_terminal`。
+- 取消是否被接受，要先和整体预算的截止点比先后（见 §6）：
+  - 作业已终态（含 `TIMED_OUT`）：返回 409 `job_already_terminal`；
+  - 作业尚未终态、但取消到达时预算已到点（`now >= budget_deadline`，例如
+    调度恰被打断、进程停在收尾前的窗口）：返回 409
+    `job_budget_deadline_reached`，取消**不落标记、不改写终态**，作业随后
+    稳定落 `TIMED_OUT`。
 
 ## 6. 作业整体时间预算（墙钟超时）
 
@@ -173,13 +180,20 @@ PENDING ──依赖满足──> READY ──获得并发槽──> RUNNING ─
 - 预算是规范化请求体的一部分：同幂等键但预算不同的重放返回
   409 `idempotency_conflict`。
 
-**与取消撞车的固定边界**（终态写定后不可变更）：
+**与取消撞车的先后判定与固定边界**（终态写定后不可变更）：
+
+判定只依据两个已持久化的墙钟时刻——取消被接受的时刻 `cancel_requested_at`
+与预算截止点 `budget_deadline`。只有 `cancel_requested_at < budget_deadline`
+才算“取消先发生”；相等或更晚一律算“取消到得太晚”。结论与调度器先处理谁、
+中间是否重启无关，因此跨重启保持一致：
 
 | 时序 | 稳定结果 |
 | --- | --- |
 | 先取消、预算后到点 | `CANCELLED`（取消先落终态） |
-| 取消已落盘、传播未完成即崩溃且停机跨过预算 | `CANCELLED`（恢复时取消仍先于预算兑现） |
-| 预算先到点、之后再取消 | `TIMED_OUT`；取消返回 409 `job_already_terminal` |
+| 取消已落盘、传播未完成即崩溃且停机跨过预算 | `CANCELLED`（恢复时按时间戳判定，取消仍在先） |
+| 预算先到点、作业已落 `TIMED_OUT` 后再取消 | 409 `job_already_terminal`，终态保持 `TIMED_OUT` |
+| 预算先到点、收尾尚未走完（调度被打断/进程停在收尾前）时取消到达 | 409 `job_budget_deadline_reached`；取消不被接受，终态仍为 `TIMED_OUT` |
+| 取消标记晚于截止点落盘、随后崩溃，停机跨过后重启 | `TIMED_OUT`（迟到取消恢复时不兑现并清除标记） |
 | 信号到达前所有步骤恰好全成功 | `SUCCEEDED`（信号“到达太晚”） |
 | 对任意已结束作业再调取消 | 409，原终态保持不变 |
 
@@ -188,10 +202,14 @@ PENDING ──依赖满足──> READY ──获得并发槽──> RUNNING ─
 - 所有状态变更在决策点同步写入 SQLite（WAL 模式，`synchronous=FULL`，写事务加锁），
   步骤的 spec 以 JSON 随步骤行持久化。
 - 服务启动（`engine.start()`）时扫描全部非终态作业：
-  - **带预算且 `now >= budget_deadline`**（预算在停机期间已走完）：不重建
-    调度器，未终态步骤直接全部 `TIMED_OUT(budget_exhausted)`，作业直接落
-    `TIMED_OUT`（trace 依据 `budget already exhausted before process
-    restarted`），已成功结果保留；
+  - **取消与预算谁先谁后按持久化时刻判定**（`cancel_requested_at` vs
+    `budget_deadline`），与运行期一致：取消真实先于到点的，即使停机期间
+    预算已走过，重启仍兑现 `CANCELLED`；取消在到点之后才落盘的，不兑现
+    并清除该迟到标记；
+  - **带预算且 `now >= budget_deadline`**（预算在停机期间已走完）且取消不
+    在先：不重建调度器，未终态步骤直接全部 `TIMED_OUT(budget_exhausted)`，
+    作业直接落 `TIMED_OUT`（trace 依据 `budget already exhausted before
+    process restarted`），已成功结果保留；
   - 带预算但仍有剩余时间：正常恢复，剩余预算继续按墙钟扣；
   - `SUCCEEDED` 步骤：结果、`attempt` 原样保留，**绝不重新执行**；
   - `PENDING/READY`：按依赖关系继续调度；
@@ -221,12 +239,12 @@ trace event=step_recovered  ... basis=process restart; no success result, resche
 ## 9. 本地验证
 
 ```bash
-uv run pytest -q                 # 全部 35 个用例
+uv run pytest -q                 # 全部 41 个用例
 uv run pytest tests/test_idempotency_concurrency.py   # 并发提交 / 幂等冲突（6）
 uv run pytest tests/test_orchestration_retry.py       # 依赖 / 并发 / 阻断 / 重试耗尽（6）
 uv run pytest tests/test_cancel.py                    # 取消传播（5）
 uv run pytest tests/test_recovery.py                  # 进程重启恢复（4）
-uv run pytest tests/test_time_budget.py               # 整体时间预算（14）
+uv run pytest tests/test_time_budget.py               # 整体时间预算（20）
 ```
 
 > 提示：也可用 `uv run python -m pytest` 调用；两种方式在干净环境
